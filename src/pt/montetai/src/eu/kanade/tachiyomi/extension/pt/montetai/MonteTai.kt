@@ -3,15 +3,20 @@ package eu.kanade.tachiyomi.extension.pt.montetai
 import eu.kanade.tachiyomi.multisrc.madara.Madara
 import eu.kanade.tachiyomi.source.model.SChapter
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.post
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.parseAs
 import okhttp3.FormBody
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import org.jsoup.nodes.Document
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlin.time.Duration.Companion.seconds
+
+internal fun isDynamicSiteRequest(url: HttpUrl, baseHost: String): Boolean = url.host == baseHost && !url.encodedPath.startsWith("/wp-content/uploads/")
 
 @Source
 abstract class MonteTai : Madara() {
@@ -19,7 +24,11 @@ abstract class MonteTai : Madara() {
 
     override val pageSize = 16
 
-    override fun OkHttpClient.Builder.configureClient() = rateLimit(3, 1.seconds)
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder {
+        val baseHost = baseUrl.toHttpUrl().host
+        return rateLimit(3, 1.seconds) { isDynamicSiteRequest(it, baseHost) }
+            .rateLimit(10, 1.seconds)
+    }
 
     override val mangaDetailsSelectorThumbnail = ".mtx-cover img"
     override val mangaDetailsSelectorAuthor = ".mtx-side-item:contains(Autor) .mtx-side-value"
@@ -40,12 +49,8 @@ abstract class MonteTai : Madara() {
             .add("manga_id", id)
             .build()
 
-        val chapterHeaders = headersBuilder()
-            .set("X-Requested-With", "XMLHttpRequest")
-            .build()
-
-        val response = client.post("$baseUrl/wp-admin/admin-ajax.php", chapterHeaders, body)
-        return response.body.string().parseAs<ChapterListDto>()
+        return client.post("$baseUrl/wp-admin/admin-ajax.php", xhrHeaders, Fetch.XHR.from(mangaPath), body)
+            .parseAs<ChapterListDto>()
             .toSChapterList(::parseChapterDate)
     }
 
