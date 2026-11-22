@@ -9,7 +9,6 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Ignore
 import org.junit.Test
 
 private const val CHAPTER_URL = "https://reader.example/manga/series/54.2"
@@ -65,10 +64,18 @@ class GateFlowTest {
         gateClient: OkHttpClient = noRedirect(client),
         gate: GateData = GateData(TOKEN, CHAPTER_PATH, 10, LINK_URL),
     ): Response = runBlocking {
-        completeGate(gate, CHAPTER_URL, client, gateClient, Headers.headersOf("User-Agent", "TestAgent"), GateTiming(), {})
+        completeGate(
+            gate = gate,
+            chapterUrl = CHAPTER_URL,
+            client = client,
+            gateClient = gateClient,
+            headers = Headers.headersOf("User-Agent", "TestAgent"),
+            timing = GateTiming(),
+            wait = {},
+            execute = { c, req, _ -> c.newCall(req).execute() },
+        )
     }
 
-    @Ignore("HTTP await is an android stub on the JVM test classpath (see issue #180 notes)")
     @Test
     fun gateLinkIsRequestedBeforeTheCallback() {
         val stub = Stub()
@@ -81,7 +88,6 @@ class GateFlowTest {
         }
     }
 
-    @Ignore("HTTP await is an android stub on the JVM test classpath (see issue #180 notes)")
     @Test
     fun gateLinkRedirectsAreNotFollowed() {
         val stub = Stub(linkStatus = 302, linkLocation = "https://affiliate.example/out?target=abc")
@@ -93,7 +99,6 @@ class GateFlowTest {
         assertEquals(listOf(LINK_URL, CALLBACK_URL), stub.urls)
     }
 
-    @Ignore("HTTP await is an android stub on the JVM test classpath (see issue #180 notes)")
     @Test
     fun gateLinkFailureDoesNotAbortTheChapter() {
         val stub = Stub(linkStatus = 500)
@@ -104,7 +109,6 @@ class GateFlowTest {
         assertEquals(listOf(LINK_URL, CALLBACK_URL), stub.urls)
     }
 
-    @Ignore("HTTP await is an android stub on the JVM test classpath (see issue #180 notes)")
     @Test
     fun missingGateUrlSkipsTheLinkRequest() {
         val stub = Stub()

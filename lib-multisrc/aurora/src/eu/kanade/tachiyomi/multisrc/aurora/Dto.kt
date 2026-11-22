@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.multisrc.aurora
 
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
+import keiyoushi.utils.MarkdownDescription
 import keiyoushi.utils.string
 import keiyoushi.utils.tryParseDate
 import kotlinx.serialization.Serializable
@@ -10,6 +11,8 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.time.format.DateTimeFormatter
+import java.time.format.DateTimeFormatterBuilder
+import java.time.temporal.ChronoField
 import java.util.Locale
 
 @Serializable
@@ -29,29 +32,26 @@ class MangaDto(
     @JsonNames("url")
     val slug: String,
     var type: String? = null,
+    val alternateName: String? = null,
     val description: String? = null,
     val author: Value? = null,
     val genre: List<String> = emptyList(),
 ) {
-    fun String.isUrl() = toHttpUrlOrNull() != null
-    fun toSManga() = SManga.create().apply {
+    fun toSManga(createManga: () -> SManga = SManga::create) = createManga().apply {
         title = this@MangaDto.title
         thumbnail_url = coverUrl
-        description = this@MangaDto.description
+        description = MarkdownDescription.Builder()
+            .description(this@MangaDto.description)
+            .altTitles(listOfNotNull(alternateName), "Títulos alternativos")
+            .build()
         author = this@MangaDto.author?.name
         genre = this@MangaDto.genre.joinToString()
-        url = when {
-            slug.isUrl() -> {
-                val location = slug.toHttpUrlOrNull()!!
-                type = location.pathSegments.first()
-                location.pathSegments.last()
-            }
-            else -> slug
-        }
+        val location = slug.toHttpUrlOrNull()
+        url = location?.pathSegments?.last() ?: slug
 
         memo = buildJsonObject {
             put("slug", url)
-            put("type", type?.lowercase())
+            put("type", (location?.pathSegments?.first() ?: type)?.lowercase())
         }
     }
 }
@@ -74,10 +74,15 @@ class ChapterDto(
     val number: String,
     val releaseDate: String,
 ) {
-    fun toSChapter(manga: SManga, serieSlug: String) = SChapter.create().apply {
+    fun toSChapter(
+        manga: SManga,
+        serieSlug: String,
+        createChapter: () -> SChapter = SChapter::create,
+    ) = createChapter().apply {
         val type = manga.memo["type"]!!.string
         name = "Capítulo $number"
-        date_upload = dateFormat.tryParseDate(releaseDate)
+        date_upload = dateFormat.tryParseDate(releaseDate).takeIf { it > 0L }
+            ?: fallbackDateFormat.tryParseDate(releaseDate.replace(".", ""))
         chapter_number = number.toFloat()
         url = id
         memo = buildJsonObject {
@@ -89,7 +94,29 @@ class ChapterDto(
     }
 
     companion object {
-        private val dateFormat = DateTimeFormatter.ofPattern("dd 'de' MMM 'de' yyyy", Locale("pt", "BR"))
+        private val dateFormat = DateTimeFormatter.ofPattern("d 'de' MMM 'de' yyyy", Locale.forLanguageTag("pt-BR"))
+        private val fallbackDateFormat = DateTimeFormatterBuilder()
+            .parseCaseInsensitive()
+            .appendPattern("d 'de' ")
+            .appendText(
+                ChronoField.MONTH_OF_YEAR,
+                mapOf(
+                    1L to "jan",
+                    2L to "fev",
+                    3L to "mar",
+                    4L to "abr",
+                    5L to "mai",
+                    6L to "jun",
+                    7L to "jul",
+                    8L to "ago",
+                    9L to "set",
+                    10L to "out",
+                    11L to "nov",
+                    12L to "dez",
+                ),
+            )
+            .appendPattern(" 'de' yyyy")
+            .toFormatter(Locale.forLanguageTag("pt-BR"))
     }
 }
 
@@ -106,4 +133,6 @@ class ImageDto(
 @Serializable
 class KeyDto(
     val k: String,
+    val v: Int? = null,
+    val e: Long? = null,
 )

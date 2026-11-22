@@ -1,6 +1,6 @@
 package eu.kanade.tachiyomi.multisrc.aurora
 
-import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.HttpException
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -10,15 +10,18 @@ import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
 import keiyoushi.network.Fetch
 import keiyoushi.network.addCookie
+import keiyoushi.network.fetch
 import keiyoushi.network.get
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
+import keiyoushi.utils.MarkdownDescription
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.extractNextJs
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.string
 import kotlinx.serialization.json.JsonObject
 import okhttp3.Headers
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -42,22 +45,33 @@ abstract class Aurora : KeiSource() {
 
     override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = defaultClient()
 
-    override fun getImageRequest(page: Page): Request = GET(
-        page.imageUrl!!,
-        headersBuilder()
-            .set("Referer", "$baseUrl/")
-            .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
-            .set("Sec-Fetch-Dest", "image")
-            .set("Sec-Fetch-Mode", "no-cors")
-            .set("Sec-Fetch-Site", "cross-site")
-            .build(),
-    )
+    private val noRedirectClient by lazy { client.newBuilder().followRedirects(false).build() }
 
-    override fun Headers.Builder.configureHeaders() = set("Sec-Fetch-Dest", "document")
-        .set("Sec-Fetch-Mode", "navigate")
-        .set("Sec-Fetch-Site", "none")
-        .set("Sec-Fetch-User", "?1")
-        .set("Alt-Used", baseUrl.substringAfterLast("/"))
+    private val readerCoordinator by lazy {
+        AuroraReaderCoordinator(
+            sourceNameProvider = { name },
+            clientProvider = { client },
+            noRedirectClientProvider = { noRedirectClient },
+            baseHeadersProvider = { headers },
+            baseUrlProvider = { baseUrl },
+        )
+    }
+
+    override fun getImageRequest(page: Page): Request {
+        val imageUrl = page.imageUrl!!.toHttpUrl()
+        val imageHeaders = headersBuilder().apply {
+            if (imageUrl.host != baseUrl.toHttpUrl().host) {
+                removeAll("Alt-Used")
+            }
+        }.build()
+        return Request.Builder()
+            .url(imageUrl)
+            .headers(imageHeaders)
+            .fetch(Fetch.IMAGE.from("$baseUrl/"))
+            .build()
+    }
+
+    override fun Headers.Builder.configureHeaders() = set("Alt-Used", baseUrl.toHttpUrl().host)
 
     override suspend fun getPopularManga(page: Int) = getMangasPage(client.get("$baseUrl/catalogo", Fetch.DOCUMENT))
 
@@ -71,6 +85,24 @@ abstract class Aurora : KeiSource() {
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         val mangas = getPopularManga(page).mangas.filter { it.title.contains(query, ignoreCase = true) }
         return MangasPage(mangas, false)
+    }
+
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        val segments = url.pathSegments.filter(String::isNotEmpty)
+        if (url.host.removePrefix("www.") != baseUrl.toHttpUrl().host.removePrefix("www.") || segments.size < 2) {
+            return null
+        }
+        val mangaUrl = baseUrl.toHttpUrl().newBuilder()
+            .addPathSegment(segments[0])
+            .addPathSegment(segments[1])
+            .build()
+        return client.get(mangaUrl, Fetch.DOCUMENT, ensureSuccess = false).use { response ->
+            when {
+                response.code == 404 -> null
+                !response.isSuccessful -> throw HttpException(response.code)
+                else -> response.asJsoup().seriesDto()?.toSManga()?.apply { initialized = true }
+            }
+        }
     }
 
     override fun getMangaUrl(manga: SManga): String = entryURL(manga.memo)
@@ -90,12 +122,12 @@ abstract class Aurora : KeiSource() {
     ): SMangaUpdate {
         val document = client.get(getMangaUrl(manga), Fetch.DOCUMENT).asJsoup()
 
-        val manga = getSMangaDetails(document, manga)
-        val chapters = document.extractNextJs<ChapterListDto>()
-            ?.toSChapterList(manga)
+        val updatedManga = getSMangaDetails(document, manga)
+        val updatedChapters = document.extractNextJs<ChapterListDto>()
+            ?.toSChapterList(updatedManga)
             ?: emptyList()
 
-        return SMangaUpdate(manga, chapters)
+        return SMangaUpdate(updatedManga, updatedChapters)
     }
 
     private val mangaDetailsDescriptionRegex = """description":"([^"]+)""".toRegex()
@@ -106,86 +138,29 @@ abstract class Aurora : KeiSource() {
     private fun getSMangaDetails(
         document: Document,
         manga: SManga,
-    ): SManga = document.selectFirst("script[type]:containsData(ComicSeries)")?.data()
-        ?.parseAs<MangaDto>()
+    ): SManga = document.seriesDto()
         ?.toSManga()
         ?: manga.apply {
             document.selectFirst("script:containsData(ComicSeries)")?.data()
                 ?.replace(cleanRegex, "")
                 ?.let {
-                    description = mangaDetailsDescriptionRegex.find(it)?.groupValues?.last()
+                    description = MarkdownDescription.Builder()
+                        .description(mangaDetailsDescriptionRegex.find(it)?.groupValues?.last())
+                        .build()
                     genre = mangaDetailsGenreRegex.find(it)?.groupValues?.last()?.parseAs<List<String>>()?.joinToString()
                     author = mangaDetailsAuthorRegex.find(it)?.groupValues?.last()
                 }
         }
 
-    private val gateTiming = GateTiming()
-
-    // The gate link redirects through an affiliate chain that breaks the chapter.
-    private val gateClient by lazy { client.newBuilder().followRedirects(false).build() }
+    private fun Document.seriesDto() = selectFirst("script[type]:containsData(ComicSeries)")?.data()?.parseAs<MangaDto>()
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val chapterUrl = getChapterUrl(chapter)
-        val counts = linkedMapOf<String, Int>()
-        var status = 0
-        fun read(response: Response): ReaderPayload = response.use {
-            status = it.code
-            extractReader(it.body.string(), it.header("Content-Type").orEmpty(), chapterUrl).also { payload ->
-                counts[payload.format] = payload.urls.size
-            }
+        val entryUrl = entryURL(chapter.memo)
+        return readerCoordinator.getPageUrls(chapterUrl, entryUrl).mapIndexed { index, url ->
+            Page(index, imageUrl = url)
         }
-
-        var payload = read(client.get(chapterUrl, readerHeaders(chapter), Fetch.DOCUMENT, ensureSuccess = false))
-        if (payload.gated) {
-            val response = unlockReader(client, gateClient, chapterUrl, readerHeaders(chapter, rsc = false), gateTiming)
-            counts["gate"] = 1
-            payload = read(response)
-            if (payload.urls.isEmpty()) {
-                payload = read(client.get(chapterUrl, readerHeaders(chapter, rsc = true), Fetch.DOCUMENT, ensureSuccess = false))
-            }
-        }
-        if (payload.urls.isEmpty() && !payload.gated && status in 200..299) {
-            payload = read(client.get(chapterUrl, readerHeaders(chapter, rsc = false), Fetch.DOCUMENT, ensureSuccess = false))
-        }
-        if (payload.urls.isEmpty()) readerFailure(name, chapterUrl, status, counts)
-
-        val urls = try {
-            decodePages(payload.urls, chapterUrl) { params -> getKey(params, chapterUrl) }
-        } catch (_: IllegalArgumentException) {
-            readerFailure(name, chapterUrl, status, counts + ("decrypt" to 0))
-        }
-        if (urls.isEmpty()) readerFailure(name, chapterUrl, status, counts + ("urls" to 0))
-        return urls.mapIndexed { index, url -> Page(index, imageUrl = url) }
     }
 
-    private fun readerHeaders(chapter: SChapter, rsc: Boolean = true): Headers {
-        val builder = headersBuilder()
-            .set("Referer", entryURL(chapter.memo))
-        if (rsc) {
-            builder
-                .set("rsc", "1")
-                .set("Sec-Fetch-Mode", "cors")
-                .set("Sec-Fetch-Dest", "empty")
-                .set("Sec-Fetch-Site", "same-origin")
-                .set("next-url", entryURL(chapter.memo).toHttpUrl().encodedPath)
-                .set("Accept", "*/*")
-        }
-        return builder.build()
-    }
-
-    internal suspend fun getKey(params: Pair<Int, Long>, chapterUrl: String): String {
-        val (v, e) = params
-        val keyHeaders = headersBuilder()
-            .set("Referer", chapterUrl)
-            .set("Sec-Fetch-Mode", "cors")
-            .set("Sec-Fetch-Dest", "empty")
-            .set("Sec-Fetch-Site", "same-origin")
-            .build()
-        val response = client.get("$baseUrl/api/atfield/key?v=$v&e=$e", keyHeaders, Fetch.XHR, ensureSuccess = false)
-        if (!response.isSuccessful) {
-            val errorBody = response.body.string()
-            error("Aurora reader key: $chapterUrl status=${response.code} error=${errorBody.take(100)}")
-        }
-        return response.parseAs<KeyDto>().k
-    }
+    internal suspend fun getKey(params: Pair<Int, Long>, chapterUrl: String): String = readerCoordinator.getKey(params, chapterUrl)
 }
