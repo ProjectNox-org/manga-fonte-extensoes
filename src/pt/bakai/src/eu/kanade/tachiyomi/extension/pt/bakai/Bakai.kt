@@ -144,12 +144,26 @@ abstract class Bakai : KeiSource() {
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val document = client.get(getChapterUrl(chapter)).asJsoup()
 
-        // The reader image class has been renamed several times
-        // (mangaReaderImage -> mangaReaderImaage -> mangaReaderV2Image -> mangaV2ReaderImage),
-        // so match all known patterns and ReaderMobile.
-        return document.select("img[class*=mangaReader], img[class*=mangaV2Reader], img[class*=ReaderImage], img.ReaderMobile").mapIndexed { i, img ->
-            val url = img.attr("abs:data-src").ifEmpty { img.attr("abs:src") }
-            Page(i, imageUrl = url)
-        }
+        // The reader container and image classes have been renamed repeatedly
+        // (e.g. mangaReaderImage -> mangaV2ReaderImage -> mangaLeitorImage / LeitorMobile).
+        val readerImages = document.select(
+            ".mangaV2ReaderImages img, " +
+                ".mangaLeitorImages img, " +
+                "img[class*=mangaLeitor], " +
+                "img[class*=mangaReader], " +
+                "img[class*=mangaV2Reader], " +
+                "img[class*=ReaderImage], " +
+                "img[class*=LeitorImage], " +
+                "img.ReaderMobile, " +
+                "img.LeitorMobile",
+        )
+
+        return readerImages
+            .mapNotNull { img ->
+                val url = img.attr("abs:data-src").ifBlank { img.attr("abs:src") }
+                url.takeIf { it.isNotBlank() && !it.startsWith("data:") }
+            }
+            .distinct()
+            .mapIndexed { i, url -> Page(i, imageUrl = url) }
     }
 }
