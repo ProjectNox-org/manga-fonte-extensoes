@@ -121,6 +121,9 @@ abstract class Aurora : KeiSource() {
 
     private val gateTiming = GateTiming()
 
+    // The gate link redirects through an affiliate chain that breaks the chapter.
+    private val gateClient by lazy { client.newBuilder().followRedirects(false).build() }
+
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val chapterUrl = getChapterUrl(chapter)
         val counts = linkedMapOf<String, Int>()
@@ -134,7 +137,7 @@ abstract class Aurora : KeiSource() {
 
         var payload = read(client.get(chapterUrl, readerHeaders(chapter), Fetch.DOCUMENT, ensureSuccess = false))
         if (payload.gated) {
-            val response = unlockReader(client, chapterUrl, readerHeaders(chapter, rsc = false), gateTiming)
+            val response = unlockReader(client, gateClient, chapterUrl, readerHeaders(chapter, rsc = false), gateTiming)
             counts["gate"] = 1
             payload = read(response)
             if (payload.urls.isEmpty()) {
