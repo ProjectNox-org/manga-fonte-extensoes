@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Hanami Heaven"
-    versionCode = 6
+    versionCode = 7
     contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
     theme = "madara"
@@ -16,4 +16,20 @@ keiyoushi {
         baseUrl = "https://hanamiheaven.org"
         id = 987786689720213769L
     }
+}
+
+android {
+    sourceSets.named("test") {
+        kotlin.directories.add("test")
+    }
+}
+
+dependencies {
+    testImplementation(libs.junit)
+    testImplementation(libs.bundles.common)
+    testImplementation(libs.tachiyomi.lib.v16)
+}
+
+tasks.matching { it.name.startsWith("ksp") && it.name.contains("UnitTest") }.configureEach {
+    enabled = false
 }
