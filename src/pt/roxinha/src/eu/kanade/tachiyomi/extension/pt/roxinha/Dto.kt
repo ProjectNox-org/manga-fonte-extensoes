@@ -8,20 +8,9 @@ import kotlinx.serialization.Serializable
 import kotlin.time.Instant
 
 @Serializable
-class LoginRequestDto(
-    private val email: String,
-    private val password: String,
-    private val rememberMe: Boolean = true,
-)
-
-@Serializable
-class LoginResponseDto(
-    val token: String,
-)
-
-@Serializable
 class ErrorDto(
-    val error: String,
+    val error: String = "",
+    val code: String? = null,
 )
 
 @Serializable
@@ -46,7 +35,7 @@ class MangaDto(
     fun toSManga(baseUrl: String) = SManga.create().apply {
         url = "$id"
         this.title = this@MangaDto.title
-        thumbnail_url = cover?.let { baseUrl + it }
+        thumbnail_url = cover?.let { resolveUrl(baseUrl, it) }
         this.author = this@MangaDto.author
         this.description = this@MangaDto.description
         genre = this@MangaDto.genres
@@ -85,7 +74,15 @@ class ChapterDto(
 class ChapterDetailsDto(
     private val pages: List<String> = emptyList(),
 ) {
-    fun toPages(baseUrl: String): List<Page> = pages.mapIndexed { index, url ->
-        Page(index, imageUrl = baseUrl + url)
-    }
+    fun toPages(baseUrl: String): List<Page> = pages
+        .filter { it.isNotBlank() }
+        .mapIndexed { index, url ->
+            Page(index, imageUrl = resolveUrl(baseUrl, url))
+        }
+}
+
+internal fun resolveUrl(baseUrl: String, path: String): String = when {
+    path.startsWith("http://") || path.startsWith("https://") -> path
+    path.startsWith("/") -> "${baseUrl.trimEnd('/')}$path"
+    else -> "${baseUrl.trimEnd('/')}/$path"
 }

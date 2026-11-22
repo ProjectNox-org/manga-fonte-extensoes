@@ -1,8 +1,24 @@
 package eu.kanade.tachiyomi.extension.pt.roxinha
-import android.text.InputType
-import androidx.preference.EditTextPreference
+
+import android.annotation.SuppressLint
+import android.app.Dialog
+import android.content.Context
+import android.graphics.Typeface
+import android.os.Handler
+import android.os.Looper
+import android.view.Gravity
+import android.view.KeyEvent
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.CookieManager
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.TextView
+import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
-import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -12,12 +28,12 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
 import keiyoushi.network.Fetch
-import keiyoushi.network.fetch
 import keiyoushi.network.get
 import keiyoushi.source.KeiSource
+import keiyoushi.utils.getLocalStorage
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
-import keiyoushi.utils.toJsonRequestBody
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -25,7 +41,7 @@ import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import java.io.IOException
+import java.text.Normalizer
 
 @Source
 abstract class Roxinha :
@@ -35,7 +51,10 @@ abstract class Roxinha :
 
     private val preferences by getPreferencesLazy()
 
-    private var token: String? = null
+    @Volatile
+    private var cachedToken: String? = null
+
+    override val imageFetch: Fetch get() = Fetch.IMAGE.from(baseUrl)
 
     override fun OkHttpClient.Builder.configureClient() = addInterceptor(::authIntercept)
 
@@ -77,7 +96,7 @@ abstract class Roxinha :
             }
         }.build()
 
-        val dto = client.get(url, Fetch.XHR).parseAs<SearchResponseDto>()
+        val dto = client.get(url, Fetch.XHR.from(baseUrl)).parseAs<SearchResponseDto>()
         val (mangas, hasMore) = dto.toMangasPage(baseUrl)
         return MangasPage(mangas, hasMore)
     }
@@ -92,7 +111,7 @@ abstract class Roxinha :
         fetchDetails: Boolean,
         fetchChapters: Boolean,
     ): SMangaUpdate {
-        val response = client.get("$apiUrl/manga/${manga.url}", Fetch.XHR)
+        val response = client.get("$apiUrl/manga/${manga.url}", Fetch.XHR.from(getMangaUrl(manga)))
         val dto = response.parseAs<MangaDto>()
 
         return SMangaUpdate(dto.toSManga(baseUrl), dto.toSChapters())
@@ -102,16 +121,23 @@ abstract class Roxinha :
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val chapterUrl = "$apiUrl/manga/chapter/${chapter.url}"
+        val chapterFetch = Fetch.XHR.from(getChapterUrl(chapter))
 
-        val accessRes = client.get("$chapterUrl/access", Fetch.XHR, ensureSuccess = false)
+        // Pick up a fresh WebView login before hitting /access when no token is cached yet.
+        if (currentToken() == null) {
+            syncTokenFromWebView()
+        }
+
+        val accessRes = client.get("$chapterUrl/access", chapterFetch, ensureSuccess = false)
         if (!accessRes.isSuccessful) {
+            val code = accessRes.code
             val message = accessRes.errorMessage()
-            throw Exception(if (accessRes.code == 401) "$message. $LOGIN_HINT" else message)
+            throw Exception(if (code == 401) "$message. $LOGIN_HINT" else message)
         }
         val accessDto = accessRes.parseAs<TicketDto>()
         val accessHeaders = headersBuilder().set("x-chapter-access", accessDto.ticket).build()
 
-        val chapterRes = client.get(chapterUrl, accessHeaders, Fetch.XHR)
+        val chapterRes = client.get(chapterUrl, accessHeaders, chapterFetch)
         val chapterDto = chapterRes.parseAs<ChapterDetailsDto>()
         return chapterDto.toPages(baseUrl)
     }
@@ -123,30 +149,66 @@ abstract class Roxinha :
     )
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        EditTextPreference(screen.context).apply {
-            key = EMAIL_PREF
-            title = "E-mail"
-            summary = LOGIN_HINT
-            setDefaultValue("")
-            setOnPreferenceChangeListener { _, _ ->
-                token = null
+        clearLegacyCredentials()
+        val hasToken = !currentToken().isNullOrBlank()
+
+        lateinit var loginPref: Preference
+        lateinit var statusPref: Preference
+        lateinit var clearPref: Preference
+
+        fun updateUi(loggedIn: Boolean) {
+            loginPref.title = if (loggedIn) "Abrir Roxinha" else "Entrar na Roxinha"
+            loginPref.summary = if (loggedIn) {
+                "Abre o site oficial da Roxinha no WebView."
+            } else {
+                "Abre o login oficial no WebView para autenticar sua conta."
+            }
+            statusPref.summary = if (loggedIn) "Conectado" else "Não conectado"
+            clearPref.setPrefBoolean("setVisible", loggedIn)
+        }
+
+        loginPref = newPreference(screen.context).apply {
+            key = PREF_LOGIN_ACTION
+            setOnPreferenceClickListener {
+                showWebViewLogin(screen.context) {
+                    updateUi(!currentToken().isNullOrBlank())
+                }
                 true
             }
         }.also(screen::addPreference)
 
-        EditTextPreference(screen.context).apply {
-            key = PASSWORD_PREF
-            title = "Senha"
-            summary = LOGIN_HINT
-            setDefaultValue("")
-            setOnBindEditTextListener {
-                it.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            }
-            setOnPreferenceChangeListener { _, _ ->
-                token = null
+        statusPref = newPreference(screen.context).apply {
+            key = PREF_SESSION_STATUS
+            title = "Sessão Roxinha"
+            setOnPreferenceClickListener { true }
+            setPrefBoolean("setSelectable", false)
+        }.also(screen::addPreference)
+
+        clearPref = newPreference(screen.context).apply {
+            key = PREF_LOGOUT_ACTION
+            title = "Sair da conta"
+            summary = "Remove a sessão salva da Roxinha neste aplicativo."
+            setOnPreferenceClickListener {
+                clearToken()
+                clearWebViewStorage(screen.context)
+                updateUi(false)
                 true
             }
         }.also(screen::addPreference)
+
+        updateUi(hasToken)
+    }
+
+    private fun newPreference(context: Context): Preference = runCatching {
+        Preference::class.java.getConstructor(Context::class.java).newInstance(context)
+    }.getOrElse { Preference() }
+
+    private fun Preference.setPrefBoolean(methodName: String, value: Boolean) {
+        runCatching {
+            this::class.java.methods
+                .firstOrNull { it.name == methodName && it.parameterTypes.contentEquals(arrayOf(Boolean::class.javaPrimitiveType)) }
+                ?.invoke(this, value)
+        }
     }
 
     private fun authIntercept(chain: Interceptor.Chain): Response {
@@ -155,17 +217,29 @@ abstract class Roxinha :
             return chain.proceed(request)
         }
 
-        val token = getToken() ?: return chain.proceed(request)
-        val response = chain.proceed(request.withToken(token))
+        val activeToken = currentToken()
+        val authedRequest = if (activeToken != null) request.withToken(activeToken) else request
+        val response = chain.proceed(authedRequest)
 
-        if (response.code != 401) {
+        if (!shouldRefreshToken(response)) {
+            return response
+        }
+
+        val freshToken = syncTokenFromWebView(staleToken = activeToken)
+        if (freshToken == null) {
             return response
         }
 
         response.close()
-        this.token = null
-        val newToken = getToken() ?: return chain.proceed(request)
-        return chain.proceed(request.withToken(newToken))
+        return chain.proceed(request.withToken(freshToken))
+    }
+
+    private fun shouldRefreshToken(response: Response): Boolean {
+        if (response.code == 401) return true
+        if (response.code != 403) return false
+        val body = runCatching { response.peekBody(2048).string() }.getOrNull() ?: return false
+        val dto = runCatching { body.parseAs<ErrorDto>() }.getOrNull() ?: return false
+        return isTokenErrorMessage(dto.error)
     }
 
     private fun Request.withToken(token: String) = newBuilder()
@@ -173,32 +247,210 @@ abstract class Roxinha :
         .build()
 
     @Synchronized
-    private fun getToken(): String? {
-        token?.let { return it }
+    private fun currentToken(): String? {
+        cachedToken?.takeIf { it.isNotBlank() }?.let { return it }
+        val saved = preferences.getString(TOKEN_PREF, null)?.takeIf { it.isNotBlank() }
+        cachedToken = saved
+        return saved
+    }
 
-        val email = preferences.getString(EMAIL_PREF, "").orEmpty()
-        val password = preferences.getString(PASSWORD_PREF, "").orEmpty()
-        if (email.isEmpty() || password.isEmpty()) {
+    @Synchronized
+    private fun syncTokenFromWebView(staleToken: String? = null): String? {
+        if (staleToken != null) {
+            clearToken()
+        }
+
+        val fromStorage = runCatching {
+            runBlocking { getLocalStorage(baseUrl, LOCAL_STORAGE_TOKEN_KEY) }
+        }.getOrNull()?.trim()?.takeIf { it.isNotEmpty() && it != "null" }
+
+        if (fromStorage == null || fromStorage == staleToken) {
             return null
         }
 
-        val body = LoginRequestDto(email.trim(), password).toJsonRequestBody()
-        val response = network.client.newCall(POST("$apiUrl/auth/login", headers, body).newBuilder().fetch(Fetch.XHR).build()).execute()
+        saveToken(fromStorage)
+        return fromStorage
+    }
 
-        if (!response.isSuccessful) {
-            throw IOException(response.errorMessage())
+    private fun saveToken(token: String) {
+        cachedToken = token
+        preferences.edit().putString(TOKEN_PREF, token).apply()
+    }
+
+    private fun clearToken() {
+        cachedToken = null
+        preferences.edit().remove(TOKEN_PREF).apply()
+    }
+
+    private fun clearLegacyCredentials() {
+        if (preferences.contains(LEGACY_EMAIL_PREF) || preferences.contains(LEGACY_PASSWORD_PREF)) {
+            preferences.edit()
+                .remove(LEGACY_EMAIL_PREF)
+                .remove(LEGACY_PASSWORD_PREF)
+                .apply()
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun clearWebViewStorage(context: Context) {
+        val webView = WebView(context)
+        webView.settings.javaScriptEnabled = true
+        webView.settings.domStorageEnabled = true
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView?, url: String?) {
+                webView.evaluateJavascript(
+                    "localStorage.removeItem('$LOCAL_STORAGE_TOKEN_KEY');localStorage.removeItem('user');",
+                ) {
+                    webView.destroy()
+                }
+            }
+        }
+        webView.loadDataWithBaseURL(baseUrl, "<link rel=\"icon\" href=\"data:,\">", "text/html", "utf-8", null)
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun showWebViewLogin(context: Context, onDone: () -> Unit) {
+        val dialog = Dialog(context)
+        val webView = WebView(context)
+        val handler = Handler(Looper.getMainLooper())
+        var finished = false
+        var destroyed = false
+
+        fun close(autoClosed: Boolean = false) {
+            if (destroyed) return
+            destroyed = true
+            handler.removeCallbacksAndMessages(null)
+            webView.stopLoading()
+            if (dialog.isShowing) dialog.dismiss()
+            webView.destroy()
+            if (autoClosed) onDone()
         }
 
-        return response.parseAs<LoginResponseDto>().token.also { token = it }
+        val density = context.resources.displayMetrics.density
+        val root = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+        val topBar = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            val pad = (12 * density).toInt()
+            setPadding(pad, pad, pad, pad)
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        }
+        topBar.addView(
+            TextView(context).apply {
+                text = "←"
+                textSize = 22f
+                setPadding(0, 0, (16 * density).toInt(), 0)
+                setOnClickListener { if (webView.canGoBack()) webView.goBack() else close() }
+            },
+        )
+        topBar.addView(
+            TextView(context).apply {
+                text = "Roxinha"
+                textSize = 17f
+                typeface = Typeface.DEFAULT_BOLD
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            },
+        )
+        topBar.addView(
+            TextView(context).apply {
+                text = "✕"
+                textSize = 20f
+                setPadding((16 * density).toInt(), 0, 0, 0)
+                setOnClickListener { close() }
+            },
+        )
+        val progress = ProgressBar(context, null, android.R.attr.progressBarStyleHorizontal).apply {
+            isIndeterminate = true
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (3 * density).toInt().coerceAtLeast(1))
+        }
+        root.addView(topBar)
+        root.addView(progress)
+        root.addView(webView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        lateinit var checkToken: () -> Unit
+        checkToken = {
+            if (!finished && !destroyed && dialog.isShowing) {
+                webView.evaluateJavascript("localStorage.getItem('$LOCAL_STORAGE_TOKEN_KEY')") { raw ->
+                    if (finished || destroyed) return@evaluateJavascript
+                    val synced = runCatching { raw.parseAs<String?>() }.getOrNull()?.trim()
+                    if (!synced.isNullOrBlank() && synced != "null") {
+                        finished = true
+                        saveToken(synced)
+                        close(autoClosed = true)
+                    } else if (!finished && !destroyed && dialog.isShowing) {
+                        handler.postDelayed({ checkToken() }, 1_000L)
+                    }
+                }
+            }
+        }
+
+        with(webView.settings) {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            useWideViewPort = true
+            loadWithOverviewMode = true
+        }
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                progress.visibility = if (newProgress >= 100) View.GONE else View.VISIBLE
+            }
+        }
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView?, url: String?) {
+                progress.visibility = View.GONE
+                handler.removeCallbacksAndMessages(null)
+                checkToken()
+            }
+        }
+        dialog.setContentView(root)
+        dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        dialog.setOnShowListener { dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT) }
+        dialog.setOnKeyListener { _, keyCode, event ->
+            if (keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP && webView.canGoBack()) {
+                webView.goBack()
+                return@setOnKeyListener true
+            }
+            false
+        }
+        dialog.setOnDismissListener {
+            if (!destroyed) {
+                destroyed = true
+                handler.removeCallbacksAndMessages(null)
+                webView.stopLoading()
+                webView.destroy()
+            }
+        }
+        dialog.show()
+        webView.loadUrl("$baseUrl/login")
     }
 
     private fun Response.errorMessage(): String = use {
-        runCatching { it.parseAs<ErrorDto>().error }.getOrDefault("Erro HTTP ${it.code}")
+        runCatching { it.parseAs<ErrorDto>().error.takeIf(String::isNotBlank) }.getOrNull() ?: "Erro HTTP ${it.code}"
     }
 
     companion object {
-        private const val EMAIL_PREF = "email"
-        private const val PASSWORD_PREF = "password"
-        private const val LOGIN_HINT = "Informe o e-mail e a senha da sua conta da Roxinha para ler os capítulos"
+        private const val TOKEN_PREF = "roxinha_token"
+        private const val LEGACY_EMAIL_PREF = "email"
+        private const val LEGACY_PASSWORD_PREF = "password"
+        private const val PREF_LOGIN_ACTION = "roxinha_login"
+        private const val PREF_SESSION_STATUS = "roxinha_session_status"
+        private const val PREF_LOGOUT_ACTION = "roxinha_logout"
+        private const val LOCAL_STORAGE_TOKEN_KEY = "token"
+        private const val LOGIN_HINT = "Faça login abrindo a Roxinha no WebView (Configurações da extensão ou 'Abrir no WebView')"
     }
+}
+
+internal fun isTokenErrorMessage(error: String): Boolean {
+    val normalized = Normalizer.normalize(error, Normalizer.Form.NFD)
+        .replace(Regex("\\p{InCombiningDiacriticalMarks}+"), "")
+        .lowercase()
+    return "token nao fornecido" in normalized ||
+        "token invalido" in normalized ||
+        "token expirado" in normalized ||
+        "usuario inativo" in normalized
 }
