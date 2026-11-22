@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.extension.pt.lycantoons
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.Headers
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -592,5 +593,73 @@ class LycanToonsTest {
         assertEquals(5, pagination?.totalPages)
         assertEquals(100, pagination?.totalItems)
         assertTrue(pagination?.hasNextPage == true)
+    }
+
+    // =========================================================================
+    // 10. Retry-After and circuit breaker coverage
+    // =========================================================================
+
+    @Test
+    fun retryAfterDelaySecondsIsParsed() {
+        assertEquals(120L, parseRetryAfterSeconds("120"))
+        assertEquals(60L, parseRetryAfterSeconds("1"))
+        assertEquals(1800L, parseRetryAfterSeconds("99999"))
+    }
+
+    @Test
+    fun retryAfterHttpDateIsConverted() {
+        val now = 1_700_000_000_000L
+        val future = "Tue, 14 Nov 2023 22:15:20 GMT" // 2 minutes after `now`
+        assertEquals(120L, parseRetryAfterSeconds(future, now))
+        assertEquals(60L, parseRetryAfterSeconds("Mon, 01 Jan 2001 00:00:00 GMT", now))
+    }
+
+    @Test
+    fun retryAfterGarbageIsIgnored() {
+        assertNull(parseRetryAfterSeconds(null))
+        assertNull(parseRetryAfterSeconds(""))
+        assertNull(parseRetryAfterSeconds("soon"))
+    }
+
+    @Test
+    fun breakerNeverShortensAnActiveBlock() {
+        LycanCircuitBreaker.tripSeconds(600)
+        LycanCircuitBreaker.tripSeconds(30)
+        assertTrue(LycanCircuitBreaker.remainingSeconds > 500)
+
+        LycanCircuitBreaker.tripSeconds(900)
+        assertTrue(LycanCircuitBreaker.remainingSeconds > 800)
+    }
+
+    @Test
+    fun retryAfterHeaderPausesTheWholeSource() {
+        var calls = 0
+        val client = OkHttpClient.Builder()
+            .addInterceptor(LycanToonsInterceptor(baseUrl))
+            .addInterceptor { chain ->
+                calls++
+                okhttp3.Response.Builder()
+                    .request(chain.request())
+                    .protocol(okhttp3.Protocol.HTTP_1_1)
+                    .code(429)
+                    .message("Too Many Requests")
+                    .header("Retry-After", "120")
+                    .body("slow down".toResponseBody("text/plain".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        client.newCall(Request.Builder().url("$baseUrl/api/series").build()).execute().close()
+
+        assertEquals(1, calls)
+        assertTrue(LycanCircuitBreaker.isBlocked)
+        assertTrue(LycanCircuitBreaker.remainingSeconds > 100)
+    }
+
+    @Test
+    fun chapterNumbersResolveAcrossFormats() {
+        assertEquals(normalizeChapterNumber("capitulo-182"), normalizeChapterNumber("182.0"))
+        assertEquals(normalizeChapterNumber("capitulo_182"), normalizeChapterNumber("182"))
+        assertEquals("182.5", normalizeChapterNumber("182.5"))
     }
 }

@@ -100,9 +100,20 @@ abstract class LycanToons : KeiSource() {
     )
     private val pagesCacheTtl = 10 * 60 * 1000L // 10 minutes
 
+    /** slug -> (chapter number -> API id). Filled by fetchMangaUpdate, so opening a chapter costs zero lookups. */
+    private class ChapterIndexCacheEntry(val byNumber: Map<String, String>, val timestamp: Long)
+
+    private val chapterIndexCache = Collections.synchronizedMap(
+        object : LinkedHashMap<String, ChapterIndexCacheEntry>(16, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ChapterIndexCacheEntry>?): Boolean = size > 16
+        },
+    )
+    private val chapterIndexTtl = 30 * 60 * 1000L // 30 minutes
+
     // =====================Popular=====================
 
     override suspend fun getPopularManga(page: Int): MangasPage = withContext(Dispatchers.IO) {
+        ensureNotBlocked()
         if (page > 1) {
             return@withContext MangasPage(emptyList(), false)
         }
@@ -170,6 +181,7 @@ abstract class LycanToons : KeiSource() {
     // =====================Search=====================
 
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage = withContext(Dispatchers.IO) {
+        ensureNotBlocked()
         var search = query.trim()
         val tags = filters.selectedTags().toMutableList()
 
@@ -311,6 +323,7 @@ abstract class LycanToons : KeiSource() {
         fetchDetails: Boolean,
         fetchChapters: Boolean,
     ): SMangaUpdate = withContext(Dispatchers.IO) {
+        ensureNotBlocked()
         val slug = manga.slug()
 
         val cached = mangaDetailsCache[slug]
@@ -342,6 +355,16 @@ abstract class LycanToons : KeiSource() {
                             fetchedChapters = apiData.chapters
                                 .map { it.toSChapter(slug) }
                                 .sortedByDescending { it.chapter_number }
+
+                            // Remember the numbers we just saw so opening a chapter needs no extra lookup.
+                            chapterIndexCache[slug] = ChapterIndexCacheEntry(
+                                apiData.chapters.mapNotNull { chapter ->
+                                    val id = chapter.id ?: return@mapNotNull null
+                                    val number = runCatching { chapter.numero.jsonPrimitive.content }.getOrNull()
+                                    number?.let { normalizeChapterNumber(it) to id.toString() }
+                                }.toMap(),
+                                System.currentTimeMillis(),
+                            )
                         }
                     }
                 }
@@ -484,6 +507,7 @@ abstract class LycanToons : KeiSource() {
     // =====================Pages========================
 
     override suspend fun getPageList(chapter: SChapter): List<Page> = withContext(Dispatchers.IO) {
+        ensureNotBlocked()
         val cached = chapterPagesCache[chapter.url]
         if (cached != null && (System.currentTimeMillis() - cached.timestamp) < pagesCacheTtl) {
             return@withContext cached.pages
@@ -492,7 +516,17 @@ abstract class LycanToons : KeiSource() {
         var capituloId = extractChapterId(chapter.url)
         var pages = emptyList<String>()
 
-        // 1. If capituloId is empty, try to resolve via API chapters endpoint
+        // 1. The chapter index cached by fetchMangaUpdate resolves the id without a request.
+        if (capituloId.isEmpty()) {
+            val parts = chapter.url.substringBefore("?").trim('/').split('/')
+            if (parts.size >= 3 && parts[0] == "series") {
+                val indexed = chapterIndexCache[parts[1]]
+                    ?.takeIf { (System.currentTimeMillis() - it.timestamp) < chapterIndexTtl }
+                capituloId = indexed?.byNumber?.get(normalizeChapterNumber(parts[2])).orEmpty()
+            }
+        }
+
+        // 2. If capituloId is still empty, try to resolve via API chapters endpoint
         if (capituloId.isEmpty()) {
             val path = chapter.url.substringBefore("?").trim('/')
             val parts = path.split('/')
@@ -635,7 +669,7 @@ abstract class LycanToons : KeiSource() {
     private suspend fun webFetch(url: String): String {
         if (!isAndroidEnv) return ""
         return runWebView(timeout = 30.seconds) {
-            userAgent = headers["User-Agent"]!!
+            // No userAgent override: the WebView's own Android UA keeps the fingerprint consistent.
             poll(1.seconds) {
                 evaluateJs(
                     """
@@ -667,7 +701,8 @@ abstract class LycanToons : KeiSource() {
                     }
                 }
             }
-            loadUrl("$baseUrl/")
+            // Load the API URL itself: one request, where the homepage pulled in the whole app shell.
+            loadUrl(url)
         }.also {
             if (it == "BLOCKED" || isAntiAbuseBlock(it)) {
                 throw LycanAntiAbuseException()
@@ -678,7 +713,7 @@ abstract class LycanToons : KeiSource() {
     private suspend fun webFetchPost(url: String, jsonBody: String): String {
         if (!isAndroidEnv) return ""
         return runWebView(timeout = 30.seconds) {
-            userAgent = headers["User-Agent"]!!
+            // No userAgent override: the WebView's own Android UA keeps the fingerprint consistent.
             val escapedJson = jsonBody.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
             poll(1.seconds) {
                 evaluateJs(
@@ -718,7 +753,8 @@ abstract class LycanToons : KeiSource() {
                     }
                 }
             }
-            loadUrl("$baseUrl/")
+            // Any tiny same-origin document works as the fetch context; the homepage used to cost dozens of requests.
+            loadUrl("$baseUrl/robots.txt")
         }.also {
             if (it == "BLOCKED" || isAntiAbuseBlock(it)) {
                 throw LycanAntiAbuseException()
@@ -729,7 +765,7 @@ abstract class LycanToons : KeiSource() {
     private suspend fun webFetchHtml(url: String): String {
         if (!isAndroidEnv) return ""
         return runWebView(timeout = 30.seconds) {
-            userAgent = headers["User-Agent"]!!
+            // No userAgent override: the WebView's own Android UA keeps the fingerprint consistent.
             poll(1.seconds) {
                 evaluateJs(
                     """
@@ -763,9 +799,19 @@ abstract class LycanToons : KeiSource() {
     }
 
     override fun getImageRequest(page: Page): Request {
+        ensureNotBlocked()
         val imageUrl = page.imageUrl
             ?: throw Exception("URL da página não informada")
         return buildLycanImageRequest(imageUrl, baseUrl, headers)
+    }
+
+    /** The reader loads images through the app's own client, so the interceptor never sees them. */
+    private fun ensureNotBlocked() {
+        if (!LycanCircuitBreaker.isBlocked) return
+        throw LycanAntiAbuseException(
+            "Acesso temporariamente bloqueado pela proteção anti-abuso da Lycan Toons. " +
+                "Cerca de ${LycanCircuitBreaker.remainingSeconds}s restantes antes de tentar novamente.",
+        )
     }
 
     private fun SManga.slug(): String = url.substringBefore("?").substringAfterLast("/")
@@ -915,12 +961,37 @@ object LycanCircuitBreaker {
         get() = maxOf(0L, (blockedUntil - System.currentTimeMillis()) / 1000L)
 
     fun trip(durationMinutes: Long = 10L) {
-        blockedUntil = System.currentTimeMillis() + (durationMinutes * 60 * 1000L)
+        tripSeconds(durationMinutes * 60L)
+    }
+
+    fun tripSeconds(durationSeconds: Long) {
+        val until = System.currentTimeMillis() + (durationSeconds * 1000L)
+        // Never shorten an active block: the server asked for it.
+        if (until > blockedUntil) blockedUntil = until
     }
 
     fun reset() {
         blockedUntil = 0L
     }
+}
+
+/**
+ * `Retry-After` as seconds. Accepts both forms of RFC 9110: delay-seconds and an HTTP date.
+ * Clamped so a broken header can neither skip the pause nor lock the app out for hours.
+ */
+internal fun parseRetryAfterSeconds(header: String?, now: Long = System.currentTimeMillis()): Long? {
+    val raw = header?.trim().orEmpty()
+    if (raw.isEmpty()) return null
+    val seconds = raw.toLongOrNull()
+        ?: runCatching { (java.time.ZonedDateTime.parse(raw, java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME).toInstant().toEpochMilli() - now) / 1000L }.getOrNull()
+        ?: return null
+    return seconds.coerceIn(60L, 30L * 60L)
+}
+
+/** `capitulo-182` and `182.0` have to resolve to the same chapter entry. */
+internal fun normalizeChapterNumber(value: String): String {
+    val raw = value.removePrefix("capitulo-").removePrefix("capitulo_").trim()
+    return raw.toFloatOrNull()?.toString() ?: raw
 }
 
 class LycanToonsInterceptor(private val baseUrl: String) : okhttp3.Interceptor {
@@ -990,6 +1061,14 @@ class LycanToonsInterceptor(private val baseUrl: String) : okhttp3.Interceptor {
         }
 
         val response = chain.proceed(builder.build())
+
+        // 429/503 with Retry-After is the site telling us exactly how long to stay away.
+        if (response.code == 429 || response.code == 503) {
+            parseRetryAfterSeconds(response.header("Retry-After"))?.let { seconds ->
+                LycanCircuitBreaker.tripSeconds(seconds)
+                System.err.println("[LycanToons] HTTP ${response.code} em ${request.url.encodedPath}: Retry-After de ${seconds}s. Requisições pausadas localmente.")
+            }
+        }
 
         // Immediate fail-fast on Cloudflare WAF anti-abuse block page
         if (!isImageReq && (response.code == 403 || response.code == 429)) {
