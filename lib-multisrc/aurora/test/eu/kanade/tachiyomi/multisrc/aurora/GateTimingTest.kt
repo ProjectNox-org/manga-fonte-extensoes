@@ -2,12 +2,14 @@ package eu.kanade.tachiyomi.multisrc.aurora
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
@@ -22,26 +24,61 @@ class GateTimingTest {
         .build()
 
     @Test
-    fun declaredEightSecondsIsUsedWithoutGoingBelowValidatedFloor() = runBlocking {
-        for (declared in listOf(8, 1)) {
-            var elapsed = 2.seconds
+    fun declaredSecondsAreHonouredExactly() = runBlocking {
+        for (declared in listOf(8, 3, 1)) {
+            var elapsed = Duration.ZERO
             GateTiming().complete(declared, elapsed = { elapsed }, wait = { elapsed += it }) {
-                assertEquals(8.seconds, elapsed)
+                assertEquals(declared.seconds, elapsed)
                 response()
             }.close()
         }
     }
 
     @Test
-    fun partnerTimeCountsTowardTenSeconds() = runBlocking {
-        var elapsed = 3.seconds
-        var calls = 0
-        GateTiming().complete(0, elapsed = { elapsed }, wait = { elapsed += it }) {
-            calls++
-            assertEquals(10.seconds, elapsed)
+    fun declaredZeroMeansNoCountdown() = runBlocking {
+        val waits = mutableListOf<Duration>()
+        GateTiming().complete(0, elapsed = { Duration.ZERO }, wait = { waits.add(it) }) { response() }.close()
+        assertEquals(listOf(Duration.ZERO), waits)
+    }
+
+    @Test
+    fun absentFieldFallsBackToTheSitesFifteenSeconds() = runBlocking {
+        var elapsed = Duration.ZERO
+        GateTiming().complete(null, elapsed = { elapsed }, wait = { elapsed += it }) {
+            assertEquals(15.seconds, elapsed)
             response()
         }.close()
-        assertEquals(1, calls)
+    }
+
+    @Test
+    fun partnerMethodSkipsTheCountdownEvenWithoutADeclaredValue() = runBlocking {
+        var waited = 0
+        GateTiming().complete(null, partner = true, elapsed = { Duration.ZERO }, wait = { waited++ }) { response() }.close()
+        assertEquals(1, waited)
+    }
+
+    @Test
+    fun gateLinkRunsWhileTheCountdownBurns() = runBlocking {
+        val events = mutableListOf<String>()
+        GateTiming().complete(
+            15,
+            elapsed = { Duration.ZERO },
+            wait = { events.add("wait-start"); yield(); events.add("wait-end") },
+            beforeRequest = { events.add("link") },
+        ) { response() }.close()
+        assertTrue(events.indexOf("link") < events.indexOf("wait-end"))
+    }
+
+    @Test
+    fun zeroIsHonouredAndTooFastTeachesTheFloor() = runBlocking {
+        val timing = GateTiming()
+        var elapsed = Duration.ZERO
+        val attempts = mutableListOf<Duration>()
+        timing.complete(0, elapsed = { elapsed }, wait = { elapsed += it }) {
+            attempts += elapsed
+            response(if (attempts.size == 1) "too_fast" else null)
+        }.close()
+        assertEquals(listOf(Duration.ZERO, 15.seconds), attempts)
     }
 
     @Test
@@ -54,7 +91,7 @@ class GateTimingTest {
             response(if (attempts.size == 1) "too_fast" else null)
         }
         result.use { assertEquals(null, it.request.url.queryParameter("gate_error")) }
-        assertEquals(listOf(10.seconds, 15.seconds), attempts)
+        assertEquals(listOf(Duration.ZERO, 15.seconds), attempts)
 
         elapsed = Duration.ZERO
         timing.complete(0, elapsed = { elapsed }, wait = { elapsed += it }) {

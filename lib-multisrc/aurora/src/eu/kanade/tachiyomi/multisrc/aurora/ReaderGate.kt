@@ -8,7 +8,9 @@ import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonRequestBody
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.Serializable
@@ -21,6 +23,7 @@ import okhttp3.Request
 import okhttp3.Response
 import java.util.Collections
 import java.util.LinkedHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
@@ -108,34 +111,63 @@ internal class GateData(
     }
 }
 
+/**
+ * Absolute monotonic offsets of one chapter open. Kept on the coordinator so a failure line and the perf tests can
+ * show where the time went; it never records URLs' query strings, tokens or cookies.
+ */
+internal class PhaseClock {
+    private val start = TimeSource.Monotonic.markNow()
+    private val marks = LinkedHashMap<String, Duration>()
+
+    fun mark(stage: String) {
+        marks[stage] = start.elapsedNow()
+    }
+
+    fun snapshot(): Map<String, Duration> = marks.toMap()
+
+    override fun toString(): String = marks.entries.joinToString(" ") { "${it.key}=${it.value.inWholeMilliseconds}ms" }
+}
+
 internal class GateTiming {
+    /** Learned floor after the server answered `too_fast`; 0 until it refuses a callback. */
     @Volatile
-    private var minimumSeconds = 8
+    private var learnedFloorSeconds = 0
 
     suspend fun complete(
         serverMinimum: Int? = null,
         partner: Boolean = false,
         elapsed: () -> Duration,
         wait: suspend (Duration) -> Unit = { delay(it) },
+        // Runs while the countdown burns, so the gate link costs no extra wall time.
+        beforeRequest: suspend () -> Unit = {},
         request: suspend () -> Response,
     ): Response {
-        // The direct gate reports 8s; the page falls back to 15s when the field is absent; the partner gate runs its
-        // own countdown, and the live check accepted 10s when it declared 0.
-        val initial: Duration = if (partner) {
-            Duration.ZERO
-        } else {
-            maxOf(minimumSeconds, (serverMinimum ?: 15).takeIf { it > 0 } ?: 10).seconds
+        // The site waits exactly `minWaitSeconds` and 15s when the field is missing; the partner gates run their own
+        // countdown. Any second above the declared value is time the server never asked for.
+        val initial: Duration = when {
+            partner -> Duration.ZERO
+            else -> maxOf(serverMinimum ?: DEFAULT_MINIMUM_SECONDS, learnedFloorSeconds).seconds
         }
-        wait((initial - elapsed()).coerceAtLeast(Duration.ZERO))
-        val response = request()
-        if (response.request.url.queryParameter("gate_error") != "too_fast") return response
 
-        response.close()
-        // Remember the refusal for this source instance instead of probing every chapter.
-        minimumSeconds = 15
-        val retry = maxOf(15, initial.inWholeSeconds.toInt() + 5).seconds
-        wait((retry - elapsed()).coerceAtLeast(Duration.ZERO))
-        return request()
+        return coroutineScope {
+            val pre = launch { beforeRequest() }
+            wait((initial - elapsed()).coerceAtLeast(Duration.ZERO))
+            pre.join()
+
+            val response = request()
+            if (response.request.url.queryParameter("gate_error") != "too_fast") return@coroutineScope response
+
+            response.close()
+            // Remember the refusal for this source instance instead of probing every chapter.
+            learnedFloorSeconds = DEFAULT_MINIMUM_SECONDS
+            val retry = maxOf(DEFAULT_MINIMUM_SECONDS, initial.inWholeSeconds.toInt() + 5).seconds
+            wait((retry - elapsed()).coerceAtLeast(Duration.ZERO))
+            request()
+        }
+    }
+
+    private companion object {
+        const val DEFAULT_MINIMUM_SECONDS = 15
     }
 }
 
@@ -161,6 +193,7 @@ internal suspend fun unlockReader(
     timing: GateTiming,
     noRedirectClient: OkHttpClient = client.newBuilder().followRedirects(false).build(),
     captchaSolver: (suspend (String) -> String)? = null,
+    clock: PhaseClock = PhaseClock(),
     execute: suspend (OkHttpClient, Request, Boolean) -> Response = { c, req, ensureSuccess ->
         c.call(req, ensureSuccess)
     },
@@ -188,6 +221,10 @@ internal suspend fun unlockReader(
     var solvedCaptcha = false
     while (true) {
         val request = startRequest(captchaToken)
+        // The server times the wait from its receipt of this request, so the countdown can start here instead of a
+        // round trip later.
+        val attemptStart = TimeSource.Monotonic.markNow()
+        clock.mark("gate-start")
         var gateResponse = execute(client, request, false)
         if (gateResponse.isChallenge()) {
             gateResponse.close()
@@ -195,8 +232,9 @@ internal suspend fun unlockReader(
             gateResponse = execute(client, request, false)
         }
         if (gateResponse.isSuccessful) {
+            clock.mark("gate-start-ok")
             val gate = gateResponse.parseAs<GateResponse>().data
-            return completeGate(gate, chapterUrl, client, noRedirectClient, headers, timing, wait, execute)
+            return completeGate(gate, chapterUrl, client, noRedirectClient, headers, timing, wait, clock, attemptStart, execute)
         }
 
         val status = gateResponse.code
@@ -223,8 +261,10 @@ internal suspend fun unlockReader(
         val reason = gateErrorReason(errorBody)
         val needsCaptcha = reason == "captcha_required" || reason == "captcha_failed"
         if (needsCaptcha && captchaSolver != null && !solvedCaptcha) {
+            clock.mark("captcha-required")
             solvedCaptcha = true
             captchaToken = captchaSolver.invoke(chapterUrl)
+            clock.mark("captcha-solved")
             continue
         }
         gateFailure("start", GATE_START_ROUTE, status, contentType, errorBody, chapter.encodedPath)
@@ -239,23 +279,15 @@ internal suspend fun completeGate(
     headers: Headers,
     timing: GateTiming,
     wait: suspend (Duration) -> Unit = { delay(it) },
+    clock: PhaseClock = PhaseClock(),
+    issued: TimeSource.Monotonic.ValueTimeMark = TimeSource.Monotonic.markNow(),
     execute: suspend (OkHttpClient, Request, Boolean) -> Response = { c, req, ensureSuccess ->
         c.call(req, ensureSuccess)
     },
 ): Response {
-    val issued = TimeSource.Monotonic.markNow()
+    clock.mark("gate-issued")
     val callback = gate.callback(chapterUrl)
     val navigationHeaders = buildGateNavigationHeaders(headers, chapterUrl)
-
-    // Visit gateUrl without following external affiliate redirects; server only checks the initial hit.
-    gate.validatedGateUrl()?.let { gateTarget ->
-        val gateVisit = Request.Builder()
-            .url(gateTarget)
-            .headers(navigationHeaders)
-            .fetch(Fetch.DOCUMENT.from(chapterUrl))
-            .build()
-        runCatching { execute(gateClient, gateVisit, false).close() }
-    }
 
     val callbackRequest = Request.Builder()
         .url(callback)
@@ -263,9 +295,30 @@ internal suspend fun completeGate(
         .fetch(Fetch.DOCUMENT.from(chapterUrl))
         .build()
 
-    val callbackResponse = timing.complete(gate.minWaitSeconds, gate.partnerMethod, issued::elapsedNow, wait) {
+    // The link is visited without following the affiliate redirects; the server only checks the initial hit.
+    // Starting it inside the countdown means a slow affiliate hop cannot add time on top of the wait.
+    val visitLink: suspend () -> Unit = {
+        gate.validatedGateUrl()?.let { gateTarget ->
+            val gateVisit = Request.Builder()
+                .url(gateTarget)
+                .headers(navigationHeaders)
+                .fetch(Fetch.DOCUMENT.from(chapterUrl))
+                .build()
+            runCatching { execute(gateClient, gateVisit, false).close() }
+            clock.mark("gate-link")
+        }
+    }
+
+    val callbackResponse = timing.complete(
+        gate.minWaitSeconds,
+        gate.partnerMethod,
+        issued::elapsedNow,
+        wait,
+        visitLink,
+    ) {
         execute(client, callbackRequest, false)
     }
+    clock.mark("gate-callback")
     val gateError = callbackResponse.request.url.queryParameter("gate_error")
     if (gateError != null) {
         callbackResponse.close()
@@ -296,6 +349,13 @@ internal class AuroraReaderCoordinator(
     private val gateMutex = Mutex()
     private val keyMutex = Mutex()
 
+    /** Bumped after every successful unlock; a waiter compares it to know whether a re-check is worth a round trip. */
+    private val unlockEpoch = AtomicInteger()
+
+    @Volatile
+    internal var lastPhases: Map<String, Duration> = emptyMap()
+        private set
+
     @Volatile
     private var cachedKey: KeyDto? = null
 
@@ -306,9 +366,14 @@ internal class AuroraReaderCoordinator(
     )
 
     suspend fun getPageUrls(chapterUrl: String, entryUrl: String): List<String> {
+        val startEpoch = unlockEpoch.get()
+        val clock = PhaseClock()
         chapterCache[chapterUrl]
             ?.takeIf { elapsedSinceProvider(it.cachedAtMark) < sessionTtl && it.urls.isNotEmpty() }
-            ?.let { return it.urls }
+            ?.let {
+                lastPhases = mapOf("cache" to Duration.ZERO)
+                return it.urls
+            }
 
         val counts = linkedMapOf<String, Int>()
         var status = 0
@@ -330,6 +395,7 @@ internal class AuroraReaderCoordinator(
         }
 
         var payload = fetchChapter(rsc = true)
+        clock.mark("probe")
         if (payload.gated) {
             payload = gateMutex.withLock {
                 // Another coroutine may have unlocked this chapter or refreshed the session while waiting.
@@ -337,9 +403,13 @@ internal class AuroraReaderCoordinator(
                     ?.takeIf { elapsedSinceProvider(it.cachedAtMark) < sessionTtl && it.urls.isNotEmpty() }
                     ?.let { return@withLock ReaderPayload(it.urls, gated = false, format = "cache") }
 
-                val recheck = fetchChapter(rsc = true)
-                if (!recheck.gated && recheck.urls.isNotEmpty()) {
-                    return@withLock recheck
+                // Only another coroutine's unlock can have changed the chapter while this one waited for the mutex.
+                if (unlockEpoch.get() != startEpoch) {
+                    val recheck = fetchChapter(rsc = true)
+                    clock.mark("recheck")
+                    if (!recheck.gated && recheck.urls.isNotEmpty()) {
+                        return@withLock recheck
+                    }
                 }
 
                 val response = unlockReader(
@@ -349,9 +419,12 @@ internal class AuroraReaderCoordinator(
                     timing = gateTiming,
                     noRedirectClient = noRedirectClientProvider(),
                     captchaSolver = captchaSolver,
+                    clock = clock,
                     execute = callExecutor,
                     wait = wait,
                 )
+                unlockEpoch.incrementAndGet()
+                clock.mark("unlocked")
                 cookieFlusher()
                 counts["gate"] = 1
                 var unlocked = read(response)
@@ -364,15 +437,17 @@ internal class AuroraReaderCoordinator(
         if (payload.urls.isEmpty() && !payload.gated && status in 200..299) {
             payload = fetchChapter(rsc = false)
         }
-        if (payload.urls.isEmpty()) readerFailure(sourceNameProvider(), chapterUrl, status, counts)
+        if (payload.urls.isEmpty()) readerFailure(sourceNameProvider(), chapterUrl, status, counts, clock.toString())
 
         val urls = try {
             decodePages(payload.urls, chapterUrl) { params -> getKey(params, chapterUrl) }
         } catch (e: IllegalArgumentException) {
             cachedKey = null
-            readerFailure(sourceNameProvider(), chapterUrl, status, counts + ("decrypt" to 0))
+            readerFailure(sourceNameProvider(), chapterUrl, status, counts + ("decrypt" to 0), clock.toString())
         }
-        if (urls.isEmpty()) readerFailure(sourceNameProvider(), chapterUrl, status, counts + ("urls" to 0))
+        if (urls.isEmpty()) readerFailure(sourceNameProvider(), chapterUrl, status, counts + ("urls" to 0), clock.toString())
+        clock.mark("decoded")
+        lastPhases = clock.snapshot()
 
         chapterCache[chapterUrl] = CachedChapter(urls = urls, cachedAtMark = markProvider())
         return urls

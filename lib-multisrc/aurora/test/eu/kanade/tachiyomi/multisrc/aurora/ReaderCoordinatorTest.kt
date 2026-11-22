@@ -381,7 +381,7 @@ class ReaderCoordinatorTest {
         assertEquals(listOf(imageUrl), coordinator.getPageUrls(chapterUrl, entryUrl))
         assertEquals(2, callbackAttempts.get())
         assertEquals(2, waits.size)
-        assertTrue(waits[0] >= 9.seconds && waits[0] <= 10.seconds)
+        assertEquals(Duration.ZERO, waits[0])
         assertTrue(waits[1] >= 14.seconds && waits[1] <= 15.seconds)
 
         waits.clear()
