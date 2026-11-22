@@ -27,6 +27,41 @@ import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimeSource
 
+private const val GATE_START_ROUTE = "/api/gate/start"
+private const val GATE_UNLOCK_ROUTE = "/api/reader/unlock"
+private val CHALLENGE_RETRY_DELAY = 1500.milliseconds
+private val challengeMarkers = listOf("Just a moment", "cf_chl", "challenge-platform", "__cf_chl_opt")
+private val errorReasonRegex = Regex("\"(?:error|message|code)\"\\s*:\\s*\"([A-Za-z0-9_.:-]{1,40})\"")
+
+/** The app's Cloudflare interceptor answers these; the retry covers a clearance cookie that landed after the request. */
+internal fun Response.isChallenge(): Boolean = header("cf-mitigated")?.equals("challenge", ignoreCase = true) == true ||
+    ((code == 403 || code == 503) && peekBody(4096).string().let(::looksLikeChallenge))
+
+internal fun looksLikeChallenge(body: String): Boolean = challengeMarkers.any { it in body }
+
+/**
+ * Mihon truncates source messages, so the HTTP status leads, the chapter query string is dropped and the body is
+ * never echoed: only a short error/message field survives, and gate tokens cannot leak into a screenshot.
+ */
+internal fun gateFailure(
+    stage: String,
+    route: String,
+    code: Int,
+    contentType: String?,
+    body: String,
+    chapterPath: String,
+): Nothing {
+    val kind = when {
+        looksLikeChallenge(body) -> "cloudflare-challenge"
+        code == 429 -> "rate-limited"
+        code == 404 || code == 405 -> "route-missing"
+        code in 500..599 -> "server-error"
+        else -> errorReasonRegex.find(body)?.groupValues?.get(1) ?: "no-reason"
+    }
+    val media = contentType?.substringBefore(';')?.takeIf { it.isNotBlank() } ?: "no-type"
+    error("Aurora gate $stage: HTTP $code $kind $media $route $chapterPath")
+}
+
 @Serializable
 internal class GateRequest(val returnTo: String)
 
@@ -115,18 +150,23 @@ internal suspend fun unlockReader(
 
     val gateHeaders = buildGateStartHeaders(headers, baseUrl, chapterUrl)
     val startRequest = Request.Builder()
-        .url("$baseUrl/api/gate/start")
+        .url("$baseUrl$GATE_START_ROUTE")
         .headers(gateHeaders)
         .post(GateRequest(chapter.encodedPath).toJsonRequestBody())
         .fetch(Fetch.XHR.from(chapterUrl))
         .build()
 
-    val gateResponse = execute(client, startRequest, false)
+    var gateResponse = execute(client, startRequest, false)
+    if (gateResponse.isChallenge()) {
+        gateResponse.close()
+        wait(CHALLENGE_RETRY_DELAY)
+        gateResponse = execute(client, startRequest, false)
+    }
     if (!gateResponse.isSuccessful) {
         val errorBody = gateResponse.use { it.body.string() }
         if (gateResponse.code == 400 && "gate_disabled" in errorBody) {
             val unlockRequest = Request.Builder()
-                .url("$baseUrl/api/reader/unlock")
+                .url("$baseUrl$GATE_UNLOCK_ROUTE")
                 .headers(gateHeaders)
                 .post(GateRequest(chapter.encodedPath).toJsonRequestBody())
                 .fetch(Fetch.XHR.from(chapterUrl))
@@ -139,7 +179,7 @@ internal suspend fun unlockReader(
                 .build()
             return execute(client, docRequest, false)
         }
-        error("Aurora reader gate start: $chapterUrl status=${gateResponse.code} error=${errorBody.take(100)}")
+        gateFailure("start", GATE_START_ROUTE, gateResponse.code, gateResponse.header("Content-Type"), errorBody, chapter.encodedPath)
     }
 
     val gate = gateResponse.parseAs<GateResponse>().data
@@ -184,7 +224,7 @@ internal suspend fun completeGate(
     val gateError = callbackResponse.request.url.queryParameter("gate_error")
     if (gateError != null) {
         callbackResponse.close()
-        error("Aurora reader gate callback: $chapterUrl gate_error=$gateError")
+        error("Aurora gate callback: gate_error=${gateError.take(40)} ${chapterUrl.toHttpUrl().encodedPath}")
     }
     return callbackResponse
 }
