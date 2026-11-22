@@ -39,6 +39,9 @@ internal fun Response.isChallenge(): Boolean = header("cf-mitigated")?.equals("c
 
 internal fun looksLikeChallenge(body: String): Boolean = challengeMarkers.any { it in body }
 
+/** `error.code` of an application JSON rejection, e.g. `captcha_required`; never a Cloudflare edge challenge. */
+internal fun gateErrorReason(body: String): String? = errorReasonRegex.find(body)?.groupValues?.get(1)
+
 /**
  * Mihon truncates source messages, so the HTTP status leads, the chapter query string is dropped and the body is
  * never echoed: only a short error/message field survives, and gate tokens cannot leak into a screenshot.
@@ -51,12 +54,14 @@ internal fun gateFailure(
     body: String,
     chapterPath: String,
 ): Nothing {
+    val reason = gateErrorReason(body)
     val kind = when {
         looksLikeChallenge(body) -> "cloudflare-challenge"
+        reason == "captcha_required" || reason == "captcha_failed" -> "captcha-required"
         code == 429 -> "rate-limited"
         code == 404 || code == 405 -> "route-missing"
         code in 500..599 -> "server-error"
-        else -> errorReasonRegex.find(body)?.groupValues?.get(1) ?: "no-reason"
+        else -> reason ?: "no-reason"
     }
     val media = contentType?.substringBefore(';')?.takeIf { it.isNotBlank() } ?: "no-type"
     error("Aurora gate $stage: HTTP $code $kind $media $route $chapterPath")
@@ -65,6 +70,10 @@ internal fun gateFailure(
 @Serializable
 internal class GateRequest(val returnTo: String)
 
+/** Second attempt after a `captcha_required`; the token comes from the site's Turnstile widget. */
+@Serializable
+internal class GateCaptchaRequest(val returnTo: String, val captchaToken: String)
+
 @Serializable
 internal class GateResponse(val data: GateData)
 
@@ -72,9 +81,13 @@ internal class GateResponse(val data: GateData)
 internal class GateData(
     val token: String,
     val returnTo: String? = null,
-    val minWaitSeconds: Int = 0,
+    val minWaitSeconds: Int? = null,
     val gateUrl: String? = null,
+    val method: String? = null,
 ) {
+    /** The partner gates run their own countdown server-side, so the client does not wait for them. */
+    val partnerMethod: Boolean get() = method == "bcm" || method == "redenovax"
+
     fun callback(chapterUrl: String): HttpUrl {
         val chapter = chapterUrl.toHttpUrl()
         require((returnTo == null || returnTo == chapter.encodedPath) && temporaryToken.matches(token)) {
@@ -100,21 +113,28 @@ internal class GateTiming {
     private var minimumSeconds = 8
 
     suspend fun complete(
-        serverMinimum: Int,
+        serverMinimum: Int? = null,
+        partner: Boolean = false,
         elapsed: () -> Duration,
         wait: suspend (Duration) -> Unit = { delay(it) },
         request: suspend () -> Response,
     ): Response {
-        // The direct gate reports 8s; the partner variant reports 0 but accepted 10s live.
-        val initial = maxOf(minimumSeconds, serverMinimum.takeIf { it > 0 } ?: 10)
-        wait((initial.seconds - elapsed()).coerceAtLeast(Duration.ZERO))
+        // The direct gate reports 8s; the page falls back to 15s when the field is absent; the partner gate runs its
+        // own countdown, and the live check accepted 10s when it declared 0.
+        val initial: Duration = if (partner) {
+            Duration.ZERO
+        } else {
+            maxOf(minimumSeconds, (serverMinimum ?: 15).takeIf { it > 0 } ?: 10).seconds
+        }
+        wait((initial - elapsed()).coerceAtLeast(Duration.ZERO))
         val response = request()
         if (response.request.url.queryParameter("gate_error") != "too_fast") return response
 
         response.close()
         // Remember the refusal for this source instance instead of probing every chapter.
         minimumSeconds = 15
-        wait((maxOf(15, initial + 5).seconds - elapsed()).coerceAtLeast(Duration.ZERO))
+        val retry = maxOf(15, initial.inWholeSeconds.toInt() + 5).seconds
+        wait((retry - elapsed()).coerceAtLeast(Duration.ZERO))
         return request()
     }
 }
@@ -140,6 +160,7 @@ internal suspend fun unlockReader(
     headers: Headers,
     timing: GateTiming,
     noRedirectClient: OkHttpClient = client.newBuilder().followRedirects(false).build(),
+    captchaSolver: (suspend (String) -> String)? = null,
     execute: suspend (OkHttpClient, Request, Boolean) -> Response = { c, req, ensureSuccess ->
         c.call(req, ensureSuccess)
     },
@@ -149,22 +170,39 @@ internal suspend fun unlockReader(
     val baseUrl = "${chapter.scheme}://${chapter.host}"
 
     val gateHeaders = buildGateStartHeaders(headers, baseUrl, chapterUrl)
-    val startRequest = Request.Builder()
-        .url("$baseUrl$GATE_START_ROUTE")
-        .headers(gateHeaders)
-        .post(GateRequest(chapter.encodedPath).toJsonRequestBody())
-        .fetch(Fetch.XHR.from(chapterUrl))
-        .build()
-
-    var gateResponse = execute(client, startRequest, false)
-    if (gateResponse.isChallenge()) {
-        gateResponse.close()
-        wait(CHALLENGE_RETRY_DELAY)
-        gateResponse = execute(client, startRequest, false)
+    fun startRequest(captchaToken: String?): Request {
+        val body = if (captchaToken == null) {
+            GateRequest(chapter.encodedPath).toJsonRequestBody()
+        } else {
+            GateCaptchaRequest(chapter.encodedPath, captchaToken).toJsonRequestBody()
+        }
+        return Request.Builder()
+            .url("$baseUrl$GATE_START_ROUTE")
+            .headers(gateHeaders)
+            .post(body)
+            .fetch(Fetch.XHR.from(chapterUrl))
+            .build()
     }
-    if (!gateResponse.isSuccessful) {
+
+    var captchaToken: String? = null
+    var solvedCaptcha = false
+    while (true) {
+        val request = startRequest(captchaToken)
+        var gateResponse = execute(client, request, false)
+        if (gateResponse.isChallenge()) {
+            gateResponse.close()
+            wait(CHALLENGE_RETRY_DELAY)
+            gateResponse = execute(client, request, false)
+        }
+        if (gateResponse.isSuccessful) {
+            val gate = gateResponse.parseAs<GateResponse>().data
+            return completeGate(gate, chapterUrl, client, noRedirectClient, headers, timing, wait, execute)
+        }
+
+        val status = gateResponse.code
+        val contentType = gateResponse.header("Content-Type")
         val errorBody = gateResponse.use { it.body.string() }
-        if (gateResponse.code == 400 && "gate_disabled" in errorBody) {
+        if (status == 400 && "gate_disabled" in errorBody) {
             val unlockRequest = Request.Builder()
                 .url("$baseUrl$GATE_UNLOCK_ROUTE")
                 .headers(gateHeaders)
@@ -179,11 +217,18 @@ internal suspend fun unlockReader(
                 .build()
             return execute(client, docRequest, false)
         }
-        gateFailure("start", GATE_START_ROUTE, gateResponse.code, gateResponse.header("Content-Type"), errorBody, chapter.encodedPath)
-    }
 
-    val gate = gateResponse.parseAs<GateResponse>().data
-    return completeGate(gate, chapterUrl, client, noRedirectClient, headers, timing, wait, execute)
+        // The app, not the edge, asks for a human check; the page answers it with its own Turnstile widget and
+        // retries the same POST with captchaToken. Retry once so a rejected/expired token cannot loop.
+        val reason = gateErrorReason(errorBody)
+        val needsCaptcha = reason == "captcha_required" || reason == "captcha_failed"
+        if (needsCaptcha && captchaSolver != null && !solvedCaptcha) {
+            solvedCaptcha = true
+            captchaToken = captchaSolver.invoke(chapterUrl)
+            continue
+        }
+        gateFailure("start", GATE_START_ROUTE, status, contentType, errorBody, chapter.encodedPath)
+    }
 }
 
 internal suspend fun completeGate(
@@ -218,7 +263,7 @@ internal suspend fun completeGate(
         .fetch(Fetch.DOCUMENT.from(chapterUrl))
         .build()
 
-    val callbackResponse = timing.complete(gate.minWaitSeconds, issued::elapsedNow, wait) {
+    val callbackResponse = timing.complete(gate.minWaitSeconds, gate.partnerMethod, issued::elapsedNow, wait) {
         execute(client, callbackRequest, false)
     }
     val gateError = callbackResponse.request.url.queryParameter("gate_error")
@@ -246,6 +291,7 @@ internal class AuroraReaderCoordinator(
     private val callExecutor: suspend (OkHttpClient, Request, Boolean) -> Response = { client, request, ensureSuccess ->
         client.call(request, ensureSuccess)
     },
+    private val captchaSolver: (suspend (String) -> String)? = null,
 ) {
     private val gateMutex = Mutex()
     private val keyMutex = Mutex()
@@ -302,6 +348,7 @@ internal class AuroraReaderCoordinator(
                     headers = readerHeaders(entryUrl, rsc = false),
                     timing = gateTiming,
                     noRedirectClient = noRedirectClientProvider(),
+                    captchaSolver = captchaSolver,
                     execute = callExecutor,
                     wait = wait,
                 )

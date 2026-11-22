@@ -25,7 +25,7 @@ class GateTimingTest {
     fun declaredEightSecondsIsUsedWithoutGoingBelowValidatedFloor() = runBlocking {
         for (declared in listOf(8, 1)) {
             var elapsed = 2.seconds
-            GateTiming().complete(declared, { elapsed }, { elapsed += it }) {
+            GateTiming().complete(declared, elapsed = { elapsed }, wait = { elapsed += it }) {
                 assertEquals(8.seconds, elapsed)
                 response()
             }.close()
@@ -36,7 +36,7 @@ class GateTimingTest {
     fun partnerTimeCountsTowardTenSeconds() = runBlocking {
         var elapsed = 3.seconds
         var calls = 0
-        GateTiming().complete(0, { elapsed }, { elapsed += it }) {
+        GateTiming().complete(0, elapsed = { elapsed }, wait = { elapsed += it }) {
             calls++
             assertEquals(10.seconds, elapsed)
             response()
@@ -49,7 +49,7 @@ class GateTimingTest {
         val timing = GateTiming()
         var elapsed = Duration.ZERO
         val attempts = mutableListOf<Duration>()
-        val result = timing.complete(0, { elapsed }, { elapsed += it }) {
+        val result = timing.complete(0, elapsed = { elapsed }, wait = { elapsed += it }) {
             attempts += elapsed
             response(if (attempts.size == 1) "too_fast" else null)
         }
@@ -57,7 +57,7 @@ class GateTimingTest {
         assertEquals(listOf(10.seconds, 15.seconds), attempts)
 
         elapsed = Duration.ZERO
-        timing.complete(0, { elapsed }, { elapsed += it }) {
+        timing.complete(0, elapsed = { elapsed }, wait = { elapsed += it }) {
             assertEquals(15.seconds, elapsed)
             response()
         }.close()
@@ -67,7 +67,7 @@ class GateTimingTest {
     fun serverMinimumIsRespectedAndRetriesAreBounded() = runBlocking {
         var elapsed = Duration.ZERO
         val attempts = mutableListOf<Duration>()
-        GateTiming().complete(20, { elapsed }, { elapsed += it }) {
+        GateTiming().complete(20, elapsed = { elapsed }, wait = { elapsed += it }) {
             attempts += elapsed
             response("too_fast")
         }.close()
@@ -77,7 +77,7 @@ class GateTimingTest {
     @Test
     fun expiredTokenIsNotRetried() = runBlocking {
         var calls = 0
-        GateTiming().complete(0, { 30.seconds }, { assertEquals(Duration.ZERO, it) }) {
+        GateTiming().complete(0, elapsed = { 30.seconds }, wait = { assertEquals(Duration.ZERO, it) }) {
             calls++
             response("expired")
         }.close()
@@ -89,7 +89,7 @@ class GateTimingTest {
         var calls = 0
         assertThrows(CancellationException::class.java) {
             runBlocking {
-                GateTiming().complete(0, { Duration.ZERO }, { throw CancellationException() }) {
+                GateTiming().complete(0, elapsed = { Duration.ZERO }, wait = { throw CancellationException() }) {
                     calls++
                     response()
                 }

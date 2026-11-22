@@ -17,6 +17,7 @@ import keiyoushi.source.KeiSource
 import keiyoushi.utils.MarkdownDescription
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.extractNextJs
+import keiyoushi.utils.getTurnstileToken
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.string
 import kotlinx.serialization.json.JsonObject
@@ -31,6 +32,19 @@ import kotlin.time.Duration.Companion.seconds
 
 @Source
 abstract class Aurora : KeiSource() {
+
+    /** Turnstile site key the reader gate renders when the app answers `captcha_required`; null when the site has none. */
+    protected open val captchaSiteKey: String? = null
+
+    /** Turnstile action the widget declares; Cloudflare rejects a token minted for a different action. */
+    protected open val captchaAction: String? = null
+
+    // Lazy so a subclass can assign both properties during its own construction.
+    private val captchaSolver: (suspend (String) -> String)? by lazy {
+        captchaSiteKey?.let { siteKey ->
+            { url: String -> getTurnstileToken(url, siteKey = siteKey, action = captchaAction) }
+        }
+    }
 
     protected fun OkHttpClient.Builder.defaultClient(): OkHttpClient.Builder = rateLimit(
         permits = 3,
@@ -54,6 +68,7 @@ abstract class Aurora : KeiSource() {
             noRedirectClientProvider = { noRedirectClient },
             baseHeadersProvider = { headers },
             baseUrlProvider = { baseUrl },
+            captchaSolver = captchaSolver,
         )
     }
 
