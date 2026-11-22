@@ -662,4 +662,25 @@ class LycanToonsTest {
         assertEquals(normalizeChapterNumber("capitulo_182"), normalizeChapterNumber("182"))
         assertEquals("182.5", normalizeChapterNumber("182.5"))
     }
+
+    @Test
+    fun pacerSpacesImageRequestsByTheMinimumGap() {
+        LycanImagePacer.reset()
+        assertEquals(0L, LycanImagePacer.reserve(1_000L))
+        assertEquals(300L, LycanImagePacer.reserve(1_000L))
+        assertEquals(300L, LycanImagePacer.reserve(1_300L))
+        assertEquals(0L, LycanImagePacer.reserve(5_000L))
+        LycanImagePacer.reset()
+    }
+
+    @Test
+    fun trafficLogCountsRequestsAndRemembersTheFirstBlock() {
+        assertTrue(LycanTrafficLog.summary().contains("api="))
+        LycanTrafficLog.record("api", 200, "/api/series")
+        LycanTrafficLog.markBlocked()
+        val firstBlock = LycanTrafficLog.summary()
+        LycanTrafficLog.markBlocked()
+        assertEquals(firstBlock, LycanTrafficLog.summary())
+        assertTrue(firstBlock.contains("firstBlock=+"))
+    }
 }

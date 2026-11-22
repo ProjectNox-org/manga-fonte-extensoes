@@ -37,6 +37,8 @@ abstract class LycanToons : KeiSource() {
 
     override fun OkHttpClient.Builder.configureClient() = apply {
         interceptors().removeAll { it.javaClass.simpleName == "CloudflareInterceptor" }
+        // OkHttp quietly retries idempotent calls on route failures; that is traffic the limiter cannot see.
+        retryOnConnectionFailure(false)
         // Rule 1: API & HTML pages: 1 request every 2 seconds
         rateLimit(permits = 1, period = 2.seconds) {
             !it.host.startsWith("cdn.") && !it.encodedPath.contains("/file/")
@@ -669,7 +671,8 @@ abstract class LycanToons : KeiSource() {
     private suspend fun webFetch(url: String): String {
         if (!isAndroidEnv) return ""
         return runWebView(timeout = 30.seconds) {
-            // No userAgent override: the WebView's own Android UA keeps the fingerprint consistent.
+            // Same identity as the OkHttp client: one app showing two user agents is what bot checks flag.
+            userAgent = headers["User-Agent"] ?: DEFAULT_USER_AGENT
             poll(1.seconds) {
                 evaluateJs(
                     """
@@ -704,7 +707,9 @@ abstract class LycanToons : KeiSource() {
             // Load the API URL itself: one request, where the homepage pulled in the whole app shell.
             loadUrl(url)
         }.also {
+            LycanTrafficLog.record("wv", 200, url.removePrefix(baseUrl).substringBefore("?").ifEmpty { "/" })
             if (it == "BLOCKED" || isAntiAbuseBlock(it)) {
+                LycanTrafficLog.markBlocked()
                 throw LycanAntiAbuseException()
             }
         }
@@ -713,7 +718,8 @@ abstract class LycanToons : KeiSource() {
     private suspend fun webFetchPost(url: String, jsonBody: String): String {
         if (!isAndroidEnv) return ""
         return runWebView(timeout = 30.seconds) {
-            // No userAgent override: the WebView's own Android UA keeps the fingerprint consistent.
+            // Same identity as the OkHttp client: one app showing two user agents is what bot checks flag.
+            userAgent = headers["User-Agent"] ?: DEFAULT_USER_AGENT
             val escapedJson = jsonBody.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
             poll(1.seconds) {
                 evaluateJs(
@@ -756,7 +762,9 @@ abstract class LycanToons : KeiSource() {
             // Any tiny same-origin document works as the fetch context; the homepage used to cost dozens of requests.
             loadUrl("$baseUrl/robots.txt")
         }.also {
+            LycanTrafficLog.record("wv", 200, url.removePrefix(baseUrl).substringBefore("?").ifEmpty { "/" })
             if (it == "BLOCKED" || isAntiAbuseBlock(it)) {
+                LycanTrafficLog.markBlocked()
                 throw LycanAntiAbuseException()
             }
         }
@@ -765,7 +773,8 @@ abstract class LycanToons : KeiSource() {
     private suspend fun webFetchHtml(url: String): String {
         if (!isAndroidEnv) return ""
         return runWebView(timeout = 30.seconds) {
-            // No userAgent override: the WebView's own Android UA keeps the fingerprint consistent.
+            // Same identity as the OkHttp client: one app showing two user agents is what bot checks flag.
+            userAgent = headers["User-Agent"] ?: DEFAULT_USER_AGENT
             poll(1.seconds) {
                 evaluateJs(
                     """
@@ -792,7 +801,9 @@ abstract class LycanToons : KeiSource() {
             }
             loadUrl(url)
         }.also {
+            LycanTrafficLog.record("wv", 200, url.removePrefix(baseUrl).substringBefore("?").ifEmpty { "/" })
             if (it == "BLOCKED" || isAntiAbuseBlock(it)) {
+                LycanTrafficLog.markBlocked()
                 throw LycanAntiAbuseException()
             }
         }
@@ -802,15 +813,19 @@ abstract class LycanToons : KeiSource() {
         ensureNotBlocked()
         val imageUrl = page.imageUrl
             ?: throw Exception("URL da página não informada")
+        // The only place we can pace reader images: they never pass through the source client.
+        LycanImagePacer.awaitSlot()
         return buildLycanImageRequest(imageUrl, baseUrl, headers)
     }
 
     /** The reader loads images through the app's own client, so the interceptor never sees them. */
     private fun ensureNotBlocked() {
         if (!LycanCircuitBreaker.isBlocked) return
+        LycanTrafficLog.markBlocked()
         throw LycanAntiAbuseException(
             "Acesso temporariamente bloqueado pela proteção anti-abuso da Lycan Toons. " +
-                "Cerca de ${LycanCircuitBreaker.remainingSeconds}s restantes antes de tentar novamente.",
+                "Cerca de ${LycanCircuitBreaker.remainingSeconds}s restantes antes de tentar novamente. " +
+                "Tráfego: ${LycanTrafficLog.summary()}",
         )
     }
 
@@ -994,13 +1009,68 @@ internal fun normalizeChapterNumber(value: String): String {
     return raw.toFloatOrNull()?.toString() ?: raw
 }
 
+/**
+ * Counts every request this process makes so a single error message answers "how much traffic
+ * came before the block?". Only paths, kinds and counts are printed: no query, cookie or token.
+ */
+internal object LycanTrafficLog {
+    private val startedAt = System.nanoTime()
+    private val counts = HashMap<String, Int>()
+    private var firstBlockAt = -1L
+    private val lock = Any()
+
+    fun record(kind: String, code: Int, path: String) {
+        val elapsed = (System.nanoTime() - startedAt) / 1_000_000
+        synchronized(lock) { counts[kind] = (counts[kind] ?: 0) + 1 }
+        System.err.println("[LycanToons] +${elapsed}ms $kind $code $path")
+    }
+
+    fun markBlocked() {
+        synchronized(lock) {
+            if (firstBlockAt < 0) firstBlockAt = (System.nanoTime() - startedAt) / 1_000_000
+        }
+    }
+
+    fun summary(): String = synchronized(lock) {
+        val first = if (firstBlockAt < 0) "none" else "+${firstBlockAt}ms"
+        "api=${counts["api"] ?: 0} img=${counts["img"] ?: 0} webview=${counts["wv"] ?: 0} firstBlock=$first"
+    }
+}
+
+/**
+ * Reader images are executed by the app's own client, so no `rateLimit` rule can see them.
+ * `getImageRequest` is the only hook available, and this keeps them at one request per [MIN_GAP_MS].
+ * shortcut: pacing is per process and ignores host, refine it per CDN host if a second CDN appears.
+ */
+internal object LycanImagePacer {
+    private const val MIN_GAP_MS = 300L
+    private val lock = Any()
+    private var nextSlot = 0L
+
+    fun reserve(now: Long = System.currentTimeMillis()): Long = synchronized(lock) {
+        val slot = maxOf(now, nextSlot)
+        nextSlot = slot + MIN_GAP_MS
+        slot - now
+    }
+
+    fun awaitSlot() {
+        val wait = reserve()
+        if (wait > 0) Thread.sleep(wait)
+    }
+
+    fun reset() {
+        synchronized(lock) { nextSlot = 0L }
+    }
+}
+
 class LycanToonsInterceptor(private val baseUrl: String) : okhttp3.Interceptor {
     override fun intercept(chain: okhttp3.Interceptor.Chain): okhttp3.Response {
         val request = chain.request()
 
         if (LycanCircuitBreaker.isBlocked) {
             val sec = LycanCircuitBreaker.remainingSeconds
-            System.err.println("[LycanToons] Circuit breaker ATIVO (${sec}s restantes): requisição para ${request.url.encodedPath} bloqueada localmente para preservar o IP.")
+            LycanTrafficLog.markBlocked()
+            System.err.println("[LycanToons] Circuit breaker ATIVO (${sec}s restantes): requisição para ${request.url.encodedPath} bloqueada localmente para preservar o IP. Tráfego: ${LycanTrafficLog.summary()}")
             throw LycanAntiAbuseException("Acesso temporariamente bloqueado pela proteção anti-abuso da Lycan Toons. Circuit breaker ativo localmente por mais ${sec}s.")
         }
 
@@ -1061,6 +1131,7 @@ class LycanToonsInterceptor(private val baseUrl: String) : okhttp3.Interceptor {
         }
 
         val response = chain.proceed(builder.build())
+        LycanTrafficLog.record(if (isImageReq) "img" else "api", response.code, request.url.encodedPath)
 
         // 429/503 with Retry-After is the site telling us exactly how long to stay away.
         if (response.code == 429 || response.code == 503) {
@@ -1075,7 +1146,8 @@ class LycanToonsInterceptor(private val baseUrl: String) : okhttp3.Interceptor {
             val peekedBody = runCatching { response.peekBody(4096).string() }.getOrNull().orEmpty()
             if (isAntiAbuseBlock(peekedBody)) {
                 LycanCircuitBreaker.trip(10)
-                System.err.println("[LycanToons] HTTP ${response.code} em ${request.url.encodedPath}: Bloqueio anti-abuso detectado pelo site. Circuit breaker ativado por 10 minutos.")
+                LycanTrafficLog.markBlocked()
+                System.err.println("[LycanToons] HTTP ${response.code} em ${request.url.encodedPath}: Bloqueio anti-abuso detectado pelo site. Circuit breaker ativado por 10 minutos. Tráfego até aqui: ${LycanTrafficLog.summary()}")
                 throw LycanAntiAbuseException()
             } else {
                 val titleMatch = Regex("<title>([^<]+)</title>", RegexOption.IGNORE_CASE).find(peekedBody)
@@ -1089,7 +1161,8 @@ class LycanToonsInterceptor(private val baseUrl: String) : okhttp3.Interceptor {
             val peeked = runCatching { response.peekBody(1024).string() }.getOrNull().orEmpty()
             if (isAntiAbuseBlock(peeked)) {
                 LycanCircuitBreaker.trip(10)
-                System.err.println("[LycanToons] CDN HTTP 403 contém bloqueio anti-abuso. Ativando circuit breaker por 10 minutos.")
+                LycanTrafficLog.markBlocked()
+                System.err.println("[LycanToons] CDN HTTP 403 contém bloqueio anti-abuso. Ativando circuit breaker por 10 minutos. Tráfego até aqui: ${LycanTrafficLog.summary()}")
             }
         }
 
