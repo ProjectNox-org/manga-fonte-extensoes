@@ -104,6 +104,35 @@ class GateTimingTest {
     }
 
     @Test
+    fun measuredPartnerFloorOfEightSecondsIsUsedOnTheFirstChapter() = runBlocking {
+        // Brasuka/Leitor profile: the gate declares 0 on a partner method but refuses until ~7.7s, so the fallback
+        // already covers the measured floor and the first callback is accepted without an escalation round trip.
+        val timing = GateTiming(fallbackSeconds = 8, trustPartnerZero = false)
+        var elapsed = Duration.ZERO
+        val attempts = mutableListOf<Duration>()
+        timing.complete(0, partner = true, elapsed = { elapsed }, wait = { elapsed += it }) {
+            attempts += elapsed
+            response()
+        }.close()
+        assertEquals(listOf(8.seconds), attempts)
+
+        // If the server later raises the floor, the escalation learns it for the following chapters.
+        elapsed = Duration.ZERO
+        val raised = mutableListOf<Duration>()
+        timing.complete(0, partner = true, elapsed = { elapsed }, wait = { elapsed += it }) {
+            raised += elapsed
+            response(if (raised.size == 1) "too_fast" else null)
+        }.close()
+        assertEquals(listOf(8.seconds, 12.seconds), raised)
+
+        elapsed = Duration.ZERO
+        timing.complete(0, partner = true, elapsed = { elapsed }, wait = { elapsed += it }) {
+            assertEquals(12.seconds, elapsed)
+            response()
+        }.close()
+    }
+
+    @Test
     fun tooFastRecoversOnceAndIsRememberedForNextChapter() = runBlocking {
         val timing = GateTiming()
         var elapsed = Duration.ZERO
