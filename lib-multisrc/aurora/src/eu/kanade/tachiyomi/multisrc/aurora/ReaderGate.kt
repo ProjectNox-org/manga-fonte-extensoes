@@ -128,10 +128,15 @@ internal class PhaseClock {
     override fun toString(): String = marks.entries.joinToString(" ") { "${it.key}=${it.value.inWholeMilliseconds}ms" }
 }
 
-internal class GateTiming {
-    /** Learned floor after the server answered `too_fast`; 0 until it refuses a callback. */
+internal class GateTiming(
+    /** Seconds to spend when the gate declares neither a usable minimum nor a trusted zero. */
+    private val fallbackSeconds: Int = 15,
+    /** Set false for sites that declare `0` on a partner method but still refuse an early callback. */
+    private val trustPartnerZero: Boolean = true,
+) {
+    /** Smallest countdown that the server actually accepted for this source instance. */
     @Volatile
-    private var learnedFloorSeconds = 0
+    private var learnedSeconds = 0
 
     suspend fun complete(
         serverMinimum: Int? = null,
@@ -141,33 +146,42 @@ internal class GateTiming {
         // Runs while the countdown burns, so the gate link costs no extra wall time.
         beforeRequest: suspend () -> Unit = {},
         request: suspend () -> Response,
-    ): Response {
-        // The site waits exactly `minWaitSeconds` and 15s when the field is missing; the partner gates run their own
-        // countdown. Any second above the declared value is time the server never asked for.
-        val initial: Duration = when {
-            partner -> Duration.ZERO
-            else -> maxOf(serverMinimum ?: DEFAULT_MINIMUM_SECONDS, learnedFloorSeconds).seconds
-        }
+    ): Response = coroutineScope {
+        var target = resolve(serverMinimum, partner)
+        val pre = launch { beforeRequest() }
+        wait((target - elapsed()).coerceAtLeast(Duration.ZERO))
+        pre.join()
 
-        return coroutineScope {
-            val pre = launch { beforeRequest() }
-            wait((initial - elapsed()).coerceAtLeast(Duration.ZERO))
-            pre.join()
-
-            val response = request()
-            if (response.request.url.queryParameter("gate_error") != "too_fast") return@coroutineScope response
-
+        var response = request()
+        var escalation = 0
+        while (response.request.url.queryParameter("gate_error") == "too_fast" && escalation < MAX_ESCALATIONS) {
             response.close()
-            // Remember the refusal for this source instance instead of probing every chapter.
-            learnedFloorSeconds = DEFAULT_MINIMUM_SECONDS
-            val retry = maxOf(DEFAULT_MINIMUM_SECONDS, initial.inWholeSeconds.toInt() + 5).seconds
-            wait((retry - elapsed()).coerceAtLeast(Duration.ZERO))
-            request()
+            escalation++
+            target = escalate(target)
+            wait((target - elapsed()).coerceAtLeast(Duration.ZERO))
+            response = request()
         }
+        if (response.request.url.queryParameter("gate_error") != "too_fast") {
+            // The token survives too_fast, so the accepted value is the real floor for the next chapters.
+            learnedSeconds = target.inWholeSeconds.toInt()
+        }
+        response
     }
 
+    private fun resolve(serverMinimum: Int?, partner: Boolean): Duration = when {
+        serverMinimum != null && serverMinimum > 0 -> serverMinimum.seconds
+        !trustPartnerZero -> maxOf(fallbackSeconds, learnedSeconds).seconds
+        partner -> Duration.ZERO
+        // A declared zero is honoured until this source sees the server refuse one.
+        serverMinimum == 0 -> learnedSeconds.seconds
+        else -> maxOf(fallbackSeconds, learnedSeconds).seconds
+    }
+
+    private fun escalate(current: Duration): Duration = maxOf(current.inWholeSeconds.toInt() + ESCALATION_STEP, learnedSeconds).seconds
+
     private companion object {
-        const val DEFAULT_MINIMUM_SECONDS = 15
+        const val ESCALATION_STEP = 4
+        const val MAX_ESCALATIONS = 2
     }
 }
 
@@ -194,6 +208,8 @@ internal suspend fun unlockReader(
     noRedirectClient: OkHttpClient = client.newBuilder().followRedirects(false).build(),
     captchaSolver: (suspend (String) -> String)? = null,
     clock: PhaseClock = PhaseClock(),
+    // Monotonic "now" shared with the coordinator so a fake clock can drive the countdown in tests.
+    now: (() -> Duration)? = null,
     execute: suspend (OkHttpClient, Request, Boolean) -> Response = { c, req, ensureSuccess ->
         c.call(req, ensureSuccess)
     },
@@ -201,6 +217,8 @@ internal suspend fun unlockReader(
 ): Response {
     val chapter = chapterUrl.toHttpUrl()
     val baseUrl = "${chapter.scheme}://${chapter.host}"
+    val startMark = TimeSource.Monotonic.markNow()
+    fun currentTime(): Duration = now?.invoke() ?: startMark.elapsedNow()
 
     val gateHeaders = buildGateStartHeaders(headers, baseUrl, chapterUrl)
     fun startRequest(captchaToken: String?): Request {
@@ -223,7 +241,7 @@ internal suspend fun unlockReader(
         val request = startRequest(captchaToken)
         // The server times the wait from its receipt of this request, so the countdown can start here instead of a
         // round trip later.
-        val attemptStart = TimeSource.Monotonic.markNow()
+        val attemptStart = currentTime()
         clock.mark("gate-start")
         var gateResponse = execute(client, request, false)
         if (gateResponse.isChallenge()) {
@@ -234,7 +252,18 @@ internal suspend fun unlockReader(
         if (gateResponse.isSuccessful) {
             clock.mark("gate-start-ok")
             val gate = gateResponse.parseAs<GateResponse>().data
-            return completeGate(gate, chapterUrl, client, noRedirectClient, headers, timing, wait, clock, attemptStart, execute)
+            return completeGate(
+                gate = gate,
+                chapterUrl = chapterUrl,
+                client = client,
+                gateClient = noRedirectClient,
+                headers = headers,
+                timing = timing,
+                wait = wait,
+                clock = clock,
+                elapsed = { currentTime() - attemptStart },
+                execute = execute,
+            )
         }
 
         val status = gateResponse.code
@@ -280,11 +309,13 @@ internal suspend fun completeGate(
     timing: GateTiming,
     wait: suspend (Duration) -> Unit = { delay(it) },
     clock: PhaseClock = PhaseClock(),
-    issued: TimeSource.Monotonic.ValueTimeMark = TimeSource.Monotonic.markNow(),
+    elapsed: (() -> Duration)? = null,
     execute: suspend (OkHttpClient, Request, Boolean) -> Response = { c, req, ensureSuccess ->
         c.call(req, ensureSuccess)
     },
 ): Response {
+    val issued = TimeSource.Monotonic.markNow()
+    val elapsedSinceIssue: () -> Duration = elapsed ?: { issued.elapsedNow() }
     clock.mark("gate-issued")
     val callback = gate.callback(chapterUrl)
     val navigationHeaders = buildGateNavigationHeaders(headers, chapterUrl)
@@ -312,7 +343,7 @@ internal suspend fun completeGate(
     val callbackResponse = timing.complete(
         gate.minWaitSeconds,
         gate.partnerMethod,
-        issued::elapsedNow,
+        elapsedSinceIssue,
         wait,
         visitLink,
     ) {
@@ -420,6 +451,7 @@ internal class AuroraReaderCoordinator(
                     noRedirectClient = noRedirectClientProvider(),
                     captchaSolver = captchaSolver,
                     clock = clock,
+                    now = { elapsedSinceProvider(0L) },
                     execute = callExecutor,
                     wait = wait,
                 )

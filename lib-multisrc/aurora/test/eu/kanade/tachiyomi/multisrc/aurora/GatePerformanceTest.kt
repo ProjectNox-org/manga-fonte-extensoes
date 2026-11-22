@@ -243,6 +243,52 @@ class GatePerformanceTest {
         assertFalse(phases.toString().contains("mugiwarasoficial"))
     }
 
+    @Test
+    fun `mugiwaras profile escalates from five seconds and then reuses the accepted floor`() = runBlocking {
+        val waits = mutableListOf<Duration>()
+        val callbackAttempts = AtomicInteger(0)
+        var simulatedMs = 0L
+        var issuedAt = 0L
+
+        val client = client { req ->
+            when (req.url.encodedPath) {
+                "/manga/tate-no-yuusha/114", "/manga/tate-no-yuusha/115" ->
+                    textResponse(req, 200, "text/x-component", gateScreen)
+                "/api/gate/start" -> {
+                    issuedAt = simulatedMs
+                    jsonResponse(req, 200, gateOk(0, "redenovax", returnTo = returnToOf(req.bodyText())))
+                }
+                "/gate/callback" -> {
+                    callbackAttempts.incrementAndGet()
+                    val elapsed = simulatedMs - issuedAt
+                    if (elapsed < 9_000) {
+                        textResponse(req.newBuilder().url("$chapterUrl?gate_error=too_fast").build(), 200, "text/html", "too fast")
+                    } else {
+                        textResponse(req, 200, "text/x-component", flight)
+                    }
+                }
+                "/api/atfield/key" -> jsonResponse(req, 200, """{"v":1,"e":20708,"k":"$key"}""")
+                else -> textResponse(req, 404, "text/plain", "not found")
+            }
+        }
+        val coordinator = coordinator(
+            client,
+            wait = { simulatedMs += it.inWholeMilliseconds; waits.add(it) },
+            timing = GateTiming(fallbackSeconds = 5, trustPartnerZero = false),
+            nowProvider = { simulatedMs },
+        )
+
+        assertEquals(listOf(imageUrl), coordinator.getPageUrls(chapterUrl, entryUrl))
+        // 5s refused, +4s accepted.
+        assertEquals(listOf(5.seconds, 4.seconds), waits)
+        assertEquals(2, callbackAttempts.get())
+
+        // The next chapter starts at the accepted floor instead of probing 5s again.
+        assertEquals(listOf(imageUrl), coordinator.getPageUrls(nextChapterUrl, entryUrl))
+        assertEquals(listOf(5.seconds, 4.seconds, 9.seconds), waits)
+        assertEquals(3, callbackAttempts.get())
+    }
+
     private fun gateOk(
         minWaitSeconds: Int,
         method: String,
@@ -258,18 +304,20 @@ class GatePerformanceTest {
     private fun coordinator(
         client: OkHttpClient,
         wait: suspend (Duration) -> Unit = {},
+        timing: GateTiming = GateTiming(),
+        nowProvider: () -> Long = { 0L },
         // Last so a trailing lambda is the captcha solver rather than the wait.
         solver: (suspend (String) -> String)? = { "unused" },
     ): AuroraReaderCoordinator {
-        var clockMs = 0L
         return AuroraReaderCoordinator(
             sourceNameProvider = { "Mugiwaras Oficial" },
             clientProvider = { client },
             noRedirectClientProvider = { client.newBuilder().followRedirects(false).build() },
             baseHeadersProvider = { Headers.headersOf("User-Agent", "Mozilla/5.0 Chrome/131.0.0.0") },
             baseUrlProvider = { "https://mugiwarasoficial.org" },
-            elapsedSinceProvider = { started -> (clockMs - started).milliseconds },
-            markProvider = { clockMs },
+            gateTiming = timing,
+            elapsedSinceProvider = { started -> (nowProvider() - started).milliseconds },
+            markProvider = { nowProvider() },
             cookieFlusher = {},
             wait = wait,
             callExecutor = syncExecutor,

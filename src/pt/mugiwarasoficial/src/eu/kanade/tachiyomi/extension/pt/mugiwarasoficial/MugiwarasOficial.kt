@@ -10,4 +10,10 @@ abstract class MugiwarasOficial : Aurora() {
     override val captchaSiteKey = "0x4AAAAAAGJWplaQoHofaEt0"
 
     override val captchaAction = "gate"
+
+    // Measured with the site's own reader: `gate/start` declares `minWaitSeconds` 0 (or omits it) while the
+    // callback answers `too_fast` until ~9s after issue. Start at 5s and let the escalation find the real floor.
+    override val gateFallbackSeconds = 5
+
+    override val gateTrustsPartnerZero = false
 }

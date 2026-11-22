@@ -70,7 +70,7 @@ class GateTimingTest {
     }
 
     @Test
-    fun zeroIsHonouredAndTooFastTeachesTheFloor() = runBlocking {
+    fun zeroIsHonouredAndTooFastEscalates() = runBlocking {
         val timing = GateTiming()
         var elapsed = Duration.ZERO
         val attempts = mutableListOf<Duration>()
@@ -78,7 +78,29 @@ class GateTimingTest {
             attempts += elapsed
             response(if (attempts.size == 1) "too_fast" else null)
         }.close()
-        assertEquals(listOf(Duration.ZERO, 15.seconds), attempts)
+        assertEquals(listOf(Duration.ZERO, 4.seconds), attempts)
+    }
+
+    @Test
+    fun unverifiedPartnerZeroStartsAtTheMeasuredFallbackAndLearns() = runBlocking {
+        // Mugiwaras profile: the gate declares 0 on a partner method but refuses until ~9s.
+        val timing = GateTiming(fallbackSeconds = 5, trustPartnerZero = false)
+        var elapsed = Duration.ZERO
+        val attempts = mutableListOf<Duration>()
+        timing.complete(0, partner = true, elapsed = { elapsed }, wait = { elapsed += it }) {
+            attempts += elapsed
+            response(if (attempts.size <= 2) "too_fast" else null)
+        }.close()
+        assertEquals(listOf(5.seconds, 9.seconds, 13.seconds), attempts)
+
+        // The accepted countdown is reused instead of probing again.
+        elapsed = Duration.ZERO
+        val next = mutableListOf<Duration>()
+        timing.complete(0, partner = true, elapsed = { elapsed }, wait = { elapsed += it }) {
+            next += elapsed
+            response()
+        }.close()
+        assertEquals(listOf(13.seconds), next)
     }
 
     @Test
@@ -91,11 +113,11 @@ class GateTimingTest {
             response(if (attempts.size == 1) "too_fast" else null)
         }
         result.use { assertEquals(null, it.request.url.queryParameter("gate_error")) }
-        assertEquals(listOf(Duration.ZERO, 15.seconds), attempts)
+        assertEquals(listOf(Duration.ZERO, 4.seconds), attempts)
 
         elapsed = Duration.ZERO
         timing.complete(0, elapsed = { elapsed }, wait = { elapsed += it }) {
-            assertEquals(15.seconds, elapsed)
+            assertEquals(4.seconds, elapsed)
             response()
         }.close()
     }
@@ -108,7 +130,7 @@ class GateTimingTest {
             attempts += elapsed
             response("too_fast")
         }.close()
-        assertEquals(listOf(20.seconds, 25.seconds), attempts)
+        assertEquals(listOf(20.seconds, 24.seconds, 28.seconds), attempts)
     }
 
     @Test

@@ -382,12 +382,12 @@ class ReaderCoordinatorTest {
         assertEquals(2, callbackAttempts.get())
         assertEquals(2, waits.size)
         assertEquals(Duration.ZERO, waits[0])
-        assertTrue(waits[1] >= 14.seconds && waits[1] <= 15.seconds)
+        assertTrue(waits[1] > 3.seconds && waits[1] <= 4.seconds)
 
         waits.clear()
         assertEquals(listOf(imageUrl), coordinator.getPageUrls("https://mugiwarasoficial.org/manga/one-piece/55", entryUrl))
         assertEquals(3, callbackAttempts.get())
-        assertTrue(waits.single() >= 14.seconds && waits.single() <= 15.seconds)
+        assertTrue(waits.single() > 3.seconds && waits.single() <= 4.seconds)
     }
 
     @Test

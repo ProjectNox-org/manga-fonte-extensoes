@@ -39,6 +39,12 @@ abstract class Aurora : KeiSource() {
     /** Turnstile action the widget declares; Cloudflare rejects a token minted for a different action. */
     protected open val captchaAction: String? = null
 
+    /** Countdown used when the gate declares nothing usable: the site's own default unless a source measured it. */
+    protected open val gateFallbackSeconds: Int = 15
+
+    /** Set false when a source sees `method` partner variants declare `0` but still refuse an early callback. */
+    protected open val gateTrustsPartnerZero: Boolean = true
+
     // Lazy so a subclass can assign both properties during its own construction.
     private val captchaSolver: (suspend (String) -> String)? by lazy {
         captchaSiteKey?.let { siteKey ->
@@ -68,6 +74,7 @@ abstract class Aurora : KeiSource() {
             noRedirectClientProvider = { noRedirectClient },
             baseHeadersProvider = { headers },
             baseUrlProvider = { baseUrl },
+            gateTiming = GateTiming(gateFallbackSeconds, gateTrustsPartnerZero),
             captchaSolver = captchaSolver,
         )
     }
