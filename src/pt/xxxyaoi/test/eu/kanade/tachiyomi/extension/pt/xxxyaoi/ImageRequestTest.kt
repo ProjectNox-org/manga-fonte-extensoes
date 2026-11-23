@@ -33,4 +33,21 @@ class ImageRequestTest {
             buildImageRequest(Page(0, "https://user:password@3xyaoi.com/chapter/", "https://3xyaoi.com/001.jpg"), "UA")
         }
     }
+
+    @Test fun preservesPlayerIframeRefererForImgPhpDownloads() {
+        val playerUrl = "https://3xyaoi.com/wp-content/plugins/3xyaoi-leitor/player.php?token=tok123"
+        val imgUrl = "https://3xyaoi.com/wp-content/plugins/3xyaoi-leitor/img.php?t=abc456"
+        val request = buildImageRequest(Page(0, playerUrl, imgUrl), "UA")
+        assertEquals(imgUrl, request.url.toString())
+        assertEquals(playerUrl, request.header("Referer"))
+        assertEquals("image/*", request.header("Accept"))
+    }
+
+    @Test fun rejectsMissingOrInvalidImageUrls() {
+        for (bad in listOf(null, "", "   ", "ftp://3xyaoi.com/1.jpg", "https://u:p@3xyaoi.com/1.jpg", "https://3xyaoi.com/1.jpg\r\nBad: header")) {
+            assertThrows(IllegalArgumentException::class.java) {
+                buildImageRequest(Page(0, chapterUrl, bad), "UA")
+            }
+        }
+    }
 }

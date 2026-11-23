@@ -166,8 +166,12 @@ internal object Reader {
      */
     fun playerIframeUrl(document: Document): String? {
         val base = document.baseUri().toHttpUrlOrNull() ?: return null
-        val iframe = document.selectFirst("iframe[src*=player.php], .reading-content iframe[src]") ?: return null
-        val raw = iframe.attr("src").trim()
+        val iframe = document.selectFirst(
+            "iframe[src*=player.php], iframe[data-src*=player.php], .reading-content iframe[src], .reading-content iframe[data-src]",
+        ) ?: return null
+        val raw = iframe.attr("src").trim().takeIf { it.isNotBlank() && !it.startsWith("about:") && !it.startsWith("data:") }
+            ?: iframe.attr("data-src").trim()
+        if (raw.isBlank()) return null
         val resolved = base.resolve(raw)?.takeIf {
             (it.scheme == "http" || it.scheme == "https") &&
                 it.host == base.host &&
@@ -196,7 +200,7 @@ internal object Reader {
         } else {
             document.select(".reader-container img, img.reader-img, main img, body img")
         }
-        val attrs = listOf("data-vhash", "data-xsec", "data-src", "data-lazy-src", "data-original", "src")
+        val attrs = listOf("data-vhash", "data-xsec", "data-src", "data-lazy-src", "data-original", "data-srcset", "srcset", "src")
         return orderedImgs.mapNotNull { img ->
             val raw = attrs.firstNotNullOfOrNull { attr ->
                 val value = img.attr(attr).trim()
@@ -204,6 +208,7 @@ internal object Reader {
                     value.isBlank() || value.startsWith("data:") || value.startsWith('#') -> null
                     attr == "data-vhash" -> VhashReader.decodeUrl(value)
                     attr == "data-xsec" -> value.reversed()
+                    attr.endsWith("srcset") -> srcsetEntry.findAll(value).lastOrNull()?.groupValues?.get(1) ?: value.substringBefore(' ').trimEnd(',')
                     else -> value
                 }
             } ?: return@mapNotNull null

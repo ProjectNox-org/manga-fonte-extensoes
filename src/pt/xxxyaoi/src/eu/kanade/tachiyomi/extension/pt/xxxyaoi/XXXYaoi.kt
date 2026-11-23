@@ -31,11 +31,14 @@ import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.Interceptor
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.io.IOException
 import java.time.format.DateTimeFormatter
 import kotlin.time.Duration.Companion.seconds
 
@@ -47,18 +50,27 @@ abstract class XXXYaoi : MadaraNoAjax() {
     override val chapterDateFormat = DateTimeFormatter.ofPattern("dd/MM/yyyy")
 
     override fun OkHttpClient.Builder.configureClient() = apply {
+        WebViewOriginHeader.ensure(baseUrl)
         interceptors().removeAll { it.javaClass.simpleName == "CloudflareInterceptor" }
         addInterceptor(ChallengeInterceptor())
+        addInterceptor(TransientRetryInterceptor())
+        addInterceptor(ImageContentInterceptor())
         rateLimit(3, 1.seconds)
         addCookie { listOfNotNull(libraryConfig?.cookie) }
     }
 
+    override val imageFetch: Fetch get() = Fetch.IMAGE
+
     // Do not leak Origin on GET navigation or override browser-matched headers.
     override fun Headers.Builder.configureHeaders() = apply {
+        WebViewOriginHeader.ensure(baseUrl)
         removeAll("Origin")
     }
 
-    override fun getHomeUrl() = "$baseUrl/biblioteca/"
+    override fun getHomeUrl(): String {
+        WebViewOriginHeader.ensure(baseUrl)
+        return "$baseUrl/biblioteca/"
+    }
 
     override val supportsLatest = true
 
@@ -88,11 +100,12 @@ abstract class XXXYaoi : MadaraNoAjax() {
         genre: String = "",
     ): MangasPage {
         suspend fun libraryData(refresh: Boolean): LibraryData {
+            val config = libraryConfig(refresh)
             val body = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
                 .addFormDataPart("action", "xyaoi_library_filter")
                 .apply {
-                    libraryConfig(refresh).formFields(page, search, status, genre)
+                    config.formFields(page, search, status, genre)
                         .forEach { (name, value) -> addFormDataPart(name, value) }
                 }
                 .addFormDataPart("search", search)
@@ -107,16 +120,34 @@ abstract class XXXYaoi : MadaraNoAjax() {
                 .addQueryParameter("action", "xyaoi_library_filter")
                 .build()
             val response = client.post(url, Fetch.XHR.from("/biblioteca/"), body, ensureSuccess = false)
-            if (!refresh && response.code == 403) {
+            if (!refresh && (response.code == 403 || response.code == 400)) {
                 response.close()
+                libraryConfig = null
                 return libraryData(refresh = true)
             }
             if (!response.isSuccessful) {
                 val code = response.code
                 response.close()
+                if (code == 403) libraryConfig = null
                 throw HttpException(code)
             }
-            return response.parseAs<LibraryResponse>().data
+            val parsed = try {
+                response.parseAs<LibraryResponse>().toLibraryData()
+            } catch (e: SerializationException) {
+                if (!refresh) {
+                    libraryConfig = null
+                    return libraryData(refresh = true)
+                }
+                throw IllegalStateException("XXX Yaoi: resposta inválida da biblioteca (json-invalid).", e)
+            }
+            if (parsed == null) {
+                if (!refresh) {
+                    libraryConfig = null
+                    return libraryData(refresh = true)
+                }
+                error("XXX Yaoi: catálogo rejeitou os parâmetros da biblioteca (ajax-rejected).")
+            }
+            return parsed
         }
 
         val library = libraryData(refresh = false)
@@ -133,13 +164,22 @@ abstract class XXXYaoi : MadaraNoAjax() {
 
     private suspend fun libraryConfig(refresh: Boolean): LibraryConfig = libraryConfigMutex.withLock {
         libraryConfig.takeUnless { refresh } ?: run {
-            val document = client.get(
-                "$baseUrl/biblioteca/",
-                Fetch.DOCUMENT,
-                if (refresh) CacheControl.FORCE_NETWORK else DEFAULT_CACHE_CONTROL,
-            ).asJsoup()
-            val container = document.selectFirst("#xyaoi-cards-container")
-            (LibraryConfig.fromContainer(container) ?: error("XXX Yaoi: configuração da biblioteca não encontrada."))
+            suspend fun fetchConfig(forceNetwork: Boolean): Pair<Document, LibraryConfig?> {
+                val document = client.get(
+                    "$baseUrl/biblioteca/",
+                    Fetch.DOCUMENT,
+                    if (forceNetwork) CacheControl.FORCE_NETWORK else DEFAULT_CACHE_CONTROL,
+                ).asJsoup()
+                return document to LibraryConfig.fromDocument(document)
+            }
+
+            var (document, config) = fetchConfig(forceNetwork = refresh)
+            if (config == null && !refresh) {
+                val retried = fetchConfig(forceNetwork = true)
+                document = retried.first
+                config = retried.second
+            }
+            (config ?: error("XXX Yaoi: configuração da biblioteca não encontrada (${LibraryConfig.diagnose(document)})."))
                 .also { libraryConfig = it }
         }
     }
@@ -273,7 +313,11 @@ abstract class XXXYaoi : MadaraNoAjax() {
             author = author ?: Layout.property(document, "Autor")?.text()?.takeIf(String::isNotBlank)
             artist = artist ?: Layout.property(document, "Artista")?.text()?.takeIf(String::isNotBlank)
             if (status == SManga.UNKNOWN) status = Layout.property(document, "Status")?.text()?.toStatus() ?: status
-            description = description ?: Layout.property(document, "Sinopse")?.text()?.takeIf(String::isNotBlank)
+            description = description
+                ?: Layout.property(document, "Sinopse")?.text()?.takeIf(String::isNotBlank)
+                ?: document.selectFirst("meta[name=description], meta[property=og:description]")?.attr("content")?.takeIf(String::isNotBlank)
+            thumbnail_url = thumbnail_url
+                ?: document.selectFirst("meta[property=og:image]")?.absUrl("content")?.takeIf(String::isNotBlank)
         }
     }
 
@@ -288,28 +332,46 @@ abstract class XXXYaoi : MadaraNoAjax() {
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val chapterUrl = getChapterUrl(chapter)
         val referer = chapterReferer(chapter, chapterUrl)
-        val first = client.get(chapterUrl, Fetch.DOCUMENT.from(referer)).asJsoup()
-        val document = if (first.selectFirst("#single-pager") != null) {
-            val listUrl = first.location().toHttpUrlOrNull()?.newBuilder()?.setQueryParameter("style", "list")?.build()
-                ?: error("XXX Yaoi: endereço de capítulo inválido.")
-            client.get(listUrl, Fetch.DOCUMENT.from(chapterUrl)).asJsoup()
-        } else {
-            first
+
+        suspend fun loadChapterDocument(): Document {
+            val first = client.get(chapterUrl, Fetch.DOCUMENT.from(referer), CacheControl.FORCE_NETWORK).asJsoup()
+            return if (first.selectFirst("#single-pager") != null) {
+                val listUrl = first.location().toHttpUrlOrNull()?.newBuilder()?.setQueryParameter("style", "list")?.build()
+                    ?: error("XXX Yaoi: endereço de capítulo inválido.")
+                client.get(listUrl, Fetch.DOCUMENT.from(chapterUrl), CacheControl.FORCE_NETWORK).asJsoup()
+            } else {
+                first
+            }
         }
 
-        val playerUrl = Reader.playerIframeUrl(document)
-        val imageUrls = if (playerUrl != null) {
-            val playerDoc = client.get(playerUrl, Fetch.DOCUMENT.from(chapterUrl)).asJsoup()
-            Reader.extractPlayerPages(playerDoc).ifEmpty {
-                Reader.load(playerDoc) { scriptUrl -> fetchScriptText(scriptUrl, playerUrl) }
+        suspend fun loadPagesOnce(document: Document): Pair<String, List<String>> {
+            val playerUrl = Reader.playerIframeUrl(document)
+            if (playerUrl != null) {
+                val playerDoc = client.get(playerUrl, Fetch.DOCUMENT.from(chapterUrl), CacheControl.FORCE_NETWORK).asJsoup()
+                val playerPages = Reader.extractPlayerPages(playerDoc).ifEmpty {
+                    runCatching { Reader.load(playerDoc) { scriptUrl -> fetchScriptText(scriptUrl, playerUrl) } }.getOrDefault(emptyList())
+                }
+                if (playerPages.isNotEmpty()) return playerUrl to playerPages
             }
-        } else {
-            Reader.load(document, { super.parsePages(document).mapNotNull(Page::imageUrl) }) { scriptUrl ->
+            val directPages = Reader.load(document, { super.parsePages(document).mapNotNull(Page::imageUrl) }) { scriptUrl ->
                 fetchScriptText(scriptUrl, chapterUrl)
+            }
+            return chapterUrl to directPages
+        }
+
+        val firstDoc = loadChapterDocument()
+        val (pageReferer, imageUrls) = try {
+            loadPagesOnce(firstDoc)
+        } catch (firstError: Reader.PagesNotFound) {
+            if (Reader.playerIframeUrl(firstDoc) != null) {
+                val refreshedDoc = loadChapterDocument()
+                loadPagesOnce(refreshedDoc)
+            } else {
+                throw firstError
             }
         }
         check(imageUrls.isNotEmpty()) { "XXX Yaoi: nenhuma página encontrada neste capítulo." }
-        return imageUrls.mapIndexed { index, url -> Page(index, chapterUrl, url) }
+        return imageUrls.mapIndexed { index, url -> Page(index, pageReferer, url) }
     }
 
     private suspend fun fetchScriptText(scriptUrl: String, referer: String): String? = client.get(scriptUrl, Fetch.SCRIPT.from(referer), ensureSuccess = false).use { response ->
@@ -355,17 +417,75 @@ abstract class XXXYaoi : MadaraNoAjax() {
         )
     }
 
-    override suspend fun fetchFilterData(): JsonElement = client.get("$baseUrl/biblioteca/", Fetch.DOCUMENT).asJsoup()
-        .select(".xyaoi-genre-item[data-genre]")
-        .mapNotNull { element ->
+    override suspend fun fetchFilterData(): JsonElement {
+        val document = client.get("$baseUrl/biblioteca/", Fetch.DOCUMENT).asJsoup()
+        val primary = document.select(".xyaoi-genre-item[data-genre]").mapNotNull { element ->
             val slug = element.attr("data-genre").trim().takeIf(String::isNotEmpty) ?: return@mapNotNull null
             val label = element.selectFirst("> span:not(.xyaoi-genre-count)")?.text()
                 ?: element.ownText().takeIf(String::isNotEmpty)
                 ?: return@mapNotNull null
             Genre(label, slug)
         }
-        .distinctBy(Genre::slug)
-        .toJsonElement()
+        val genres = primary.ifEmpty {
+            document.select("a[href*='/biblioteca/?genre='], a[href*='/genero/']").mapNotNull { link ->
+                val url = link.absUrl("href").toHttpUrlOrNull() ?: return@mapNotNull null
+                val slug = url.queryParameter("genre")?.trim()?.takeIf(String::isNotEmpty)
+                    ?: url.pathSegments.filter(String::isNotEmpty).takeIf { it.size == 2 && it[0] == genreDirectory }?.get(1)
+                    ?: return@mapNotNull null
+                val label = link.text().trim().takeIf(String::isNotEmpty) ?: return@mapNotNull null
+                Genre(label, slug)
+            }
+        }
+        return genres.distinctBy(Genre::slug).toJsonElement()
+    }
+}
+
+internal class TransientRetryInterceptor(
+    private val maxRetries: Int = 2,
+    private val sleepMs: (Long) -> Unit = { Thread.sleep(it) },
+) : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        var attempt = 0
+        var response = chain.proceed(request)
+        if (request.method != "GET") return response
+        while (attempt < maxRetries && response.code in RETRY_CODES && !chain.call().isCanceled()) {
+            // Do not hijack Cloudflare challenges (handled by ChallengeInterceptor).
+            if (response.isCloudflareChallenge()) break
+            val waitMs = retryDelayMs(response, attempt)
+            response.close()
+            attempt++
+            sleepMs(waitMs)
+            if (chain.call().isCanceled()) throw IOException("Request canceled")
+            response = chain.proceed(request)
+        }
+        return response
+    }
+
+    private fun retryDelayMs(response: Response, attempt: Int): Long {
+        val retryAfter = response.header("Retry-After")?.trim()?.toLongOrNull()
+        if (retryAfter != null && retryAfter in 1..3) return retryAfter * 1000L
+        return if (attempt == 0) 400L else 900L
+    }
+
+    companion object {
+        private val RETRY_CODES = setOf(429, 502, 503, 504)
+    }
+}
+
+internal class ImageContentInterceptor : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val response = chain.proceed(request)
+        val expectsImage = request.header("Accept")?.contains("image/", ignoreCase = true) == true
+        if (!expectsImage || !response.isSuccessful) return response
+        val contentType = response.header("Content-Type")?.lowercase().orEmpty()
+        if (contentType.startsWith("text/html") || contentType.startsWith("application/xhtml")) {
+            response.close()
+            throw IOException("XXX Yaoi: resposta HTML inesperada ao baixar imagem.")
+        }
+        return response
+    }
 }
 
 internal fun buildImageRequest(page: Page, userAgent: String?): Request {
@@ -373,8 +493,14 @@ internal fun buildImageRequest(page: Page, userAgent: String?): Request {
     val chapterUrl = page.url.toHttpUrlOrNull()
         ?: throw IllegalArgumentException("XXX Yaoi: referência de capítulo inválida.")
     require(chapterUrl.username.isEmpty() && chapterUrl.password.isEmpty()) { "XXX Yaoi: referência de capítulo inválida." }
+    val rawImageUrl = page.imageUrl?.trim()
+        ?.takeIf { it.isNotEmpty() && '\n' !in it && '\r' !in it }
+        ?: throw IllegalArgumentException("XXX Yaoi: endereço de imagem inválido.")
+    val imageUrl = rawImageUrl.toHttpUrlOrNull()
+        ?.takeIf { (it.scheme == "http" || it.scheme == "https") && it.username.isEmpty() && it.password.isEmpty() }
+        ?: throw IllegalArgumentException("XXX Yaoi: endereço de imagem inválido.")
     return Request.Builder()
-        .url(page.imageUrl!!)
+        .url(imageUrl)
         .headers(
             Headers.Builder().apply {
                 userAgent?.let { set("User-Agent", it) }
