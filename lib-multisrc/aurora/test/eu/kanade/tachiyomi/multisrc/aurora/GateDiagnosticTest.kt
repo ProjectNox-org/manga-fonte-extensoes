@@ -139,6 +139,31 @@ class GateDiagnosticTest {
         assertTrue(message, "server-error" in message)
     }
 
+    @Test
+    fun unrecognisedBodyLeadsTheFailureLine() {
+        // Mihon truncates the tail, so the body has to come first or the cause is never visible.
+        val message = failure { request -> response(request, 403, """{"success":false}""") }
+        assertTrue(message, message.startsWith("""{"success":false} — Aurora gate start: HTTP 403 no-reason"""))
+    }
+
+    @Test
+    fun traceNamesTheAttemptThatLedToTheUnlock() {
+        val error = assertThrows(IllegalStateException::class.java) {
+            gateFailure(
+                "unlock",
+                "/api/reader/unlock",
+                403,
+                "application/json",
+                """{"success":false}""",
+                CHAPTER_PATH,
+                trace = "start=403/captcha_required",
+            )
+        }
+        val message = error.message ?: ""
+        assertTrue(message, message.startsWith("""{"success":false} — Aurora gate unlock: HTTP 403 no-reason"""))
+        assertTrue(message, "start=403/captcha_required" in message)
+    }
+
     companion object {
         @BeforeClass
         @JvmStatic
