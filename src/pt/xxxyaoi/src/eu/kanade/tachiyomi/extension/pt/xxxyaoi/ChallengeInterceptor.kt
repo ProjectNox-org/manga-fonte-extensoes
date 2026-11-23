@@ -40,13 +40,18 @@ class ChallengeInterceptor : Interceptor {
 
     private fun pass(chain: Interceptor.Chain, request: Request) {
         val origin = "${request.url.scheme}://${request.url.host}"
+        val targetUrl = challengeNavigationUrl(request, origin)
         try {
             val previous = clearance(origin)
             val started = TimeSource.Monotonic.markNow()
             var shown = false
             runWebViewBlocking<Unit>(chain.call(), TIMEOUT) {
                 userAgent = request.header("User-Agent").orEmpty()
-                setOriginMatchedHeader("X-Requested-With", "", setOf(origin))
+                setOriginMatchedHeader(
+                    "X-Requested-With",
+                    "",
+                    WebViewOriginHeader.originRulesFor(origin).ifEmpty { setOf(origin) },
+                )
                 poll(POLL_INTERVAL) {
                     val current = clearance(origin)
                     if (current != null && current != previous) {
@@ -55,8 +60,9 @@ class ChallengeInterceptor : Interceptor {
                         shown = showToUser(TURNSTILE_AREA)
                     }
                 }
-                loadUrl(request.url.toString())
+                loadUrl(targetUrl)
             }
+            CookieManager.getInstance().flush()
         } catch (e: UnsupportedOperationException) {
             throw IOException("Atualize o Android System WebView para passar pela verificação do Cloudflare.", e)
         } catch (e: IOException) {
@@ -66,24 +72,49 @@ class ChallengeInterceptor : Interceptor {
         }
     }
 
+    private fun challengeNavigationUrl(request: Request, origin: String): String {
+        val url = request.url
+        val path = url.encodedPath.lowercase()
+        val isSubresource = path.endsWith(".jpg") ||
+            path.endsWith(".jpeg") ||
+            path.endsWith(".png") ||
+            path.endsWith(".webp") ||
+            path.endsWith(".avif") ||
+            path.endsWith(".gif") ||
+            path.endsWith("img.php") ||
+            path.endsWith("admin-ajax.php") ||
+            path.endsWith(".js")
+        if (!isSubresource) return url.toString()
+        val referer = request.header("Referer")?.trim()
+        if (!referer.isNullOrEmpty() && referer.startsWith(origin) && !referer.endsWith("img.php")) {
+            return referer
+        }
+        return "$origin/biblioteca/"
+    }
+
     private fun clearance(origin: String): String? = CookieManager.getInstance().getCookie(origin)
         ?.split("; ")
         ?.firstOrNull { it.startsWith("cf_clearance=") }
 
-    private fun Response.isChallenge(): Boolean {
-        if (code != 403) return false
-        if (header("cf-mitigated") == "challenge") return true
-        val snippet = try {
-            peekBody(4096).string()
-        } catch (_: IOException) {
-            ""
-        }
-        return snippet.contains("_cf_chl_opt") || snippet.contains("cf-turnstile")
-    }
+    private fun Response.isChallenge(): Boolean = isCloudflareChallenge()
 
     companion object {
         private val TIMEOUT = 60.seconds
         private val POLL_INTERVAL = 250.milliseconds
         private val SHOW_AFTER = 6.seconds
     }
+}
+
+internal fun Response.isCloudflareChallenge(): Boolean {
+    if (code != 403 && code != 503) return false
+    if (header("cf-mitigated") == "challenge") return true
+    val snippet = try {
+        peekBody(8192).string()
+    } catch (_: IOException) {
+        ""
+    }
+    return snippet.contains("_cf_chl_opt") ||
+        snippet.contains("cf-turnstile") ||
+        snippet.contains("/cdn-cgi/challenge-platform") ||
+        snippet.contains("Just a moment")
 }

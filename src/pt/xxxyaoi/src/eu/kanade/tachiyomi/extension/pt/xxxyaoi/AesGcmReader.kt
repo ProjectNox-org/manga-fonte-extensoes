@@ -19,7 +19,8 @@ internal object AesGcmReader {
         """(?s)\b[A-Za-z_$][A-Za-z0-9_$]*\s*\(\s*\w+\.dataset\.([A-Za-z][A-Za-z0-9_]*)\s*,\s*\w+\.dataset\.([A-Za-z][A-Za-z0-9_]*)\s*,\s*\w+\.dataset\.([A-Za-z][A-Za-z0-9_]*)\s*,\s*\w+\.dataset\.([A-Za-z][A-Za-z0-9_]*)\s*\)""",
     )
     private val salt = Regex("""salt\s*:\s*new\s+TextEncoder\s*\(\s*\)\.encode\s*\(\s*["']([^"']+)["']\s*\)""")
-    private val iterations = Regex("""iterations\s*:\s*(\d+)""")
+    private val iterations = Regex("""iterations\s*:\s*(0[xX][\da-fA-F]+|\d+)""")
+    private val getDataAttr = Regex("""\bgetAttribute\s*\(\s*["'](data-[\w-]+)["']\s*\)""")
 
     private fun scripts(document: Document) = document.select("script:not([src])").map { it.data() }.filter {
         it.contains("crypto.subtle.deriveKey") && it.contains("crypto.subtle.decrypt") &&
@@ -42,11 +43,14 @@ internal object AesGcmReader {
             ?: throw Reader.PagesNotFound("aes-container-missing")
         val fields = decryptCall.findAll(source).map { match -> match.groupValues.drop(1) }.distinct().singleOrNull()
             ?: dataset.findAll(source).map { it.groupValues[1] }.distinct().toList().takeIf { it.size == 4 }
+        val names = fields?.map(::dataName)
+            ?: getDataAttr.findAll(source).map { it.groupValues[1] }.distinct().toList().takeIf { it.size == 4 }
             ?: throw Reader.PagesNotFound("aes-fields-missing-or-ambiguous")
-        val names = fields.map(::dataName)
         if (names.any { !container.hasAttr(it) }) throw Reader.PagesNotFound("aes-fields-missing")
         val saltValue = salt.find(source)?.groupValues?.get(1) ?: throw Reader.PagesNotFound("aes-salt-missing")
-        val rounds = iterations.find(source)?.groupValues?.get(1)?.toIntOrNull()?.takeIf { it in 1..1_000_000 }
+        val rawRounds = iterations.find(source)?.groupValues?.get(1) ?: throw Reader.PagesNotFound("aes-iterations-invalid")
+        val rounds = (if (rawRounds.startsWith("0x", true)) rawRounds.drop(2).toIntOrNull(16) else rawRounds.toIntOrNull())
+            ?.takeIf { it in 1..1_000_000 }
             ?: throw Reader.PagesNotFound("aes-iterations-invalid")
 
         val ciphertext = decode(container.attr(names[0])) ?: throw Reader.PagesNotFound("aes-ciphertext-invalid")
