@@ -42,6 +42,9 @@ abstract class Aurora : KeiSource() {
     /** Countdown used when the gate declares nothing usable: the site's own default unless a source measured it. */
     protected open val gateFallbackSeconds: Int = 15
 
+    /** Set true when the site verifies the Turnstile token on the reader unlock route instead of a retried gate start. */
+    protected open val captchaUnlocksReader: Boolean = false
+
     /** Set false when a source sees `method` partner variants declare `0` but still refuse an early callback. */
     protected open val gateTrustsPartnerZero: Boolean = true
 
@@ -67,6 +70,9 @@ abstract class Aurora : KeiSource() {
 
     private val noRedirectClient by lazy { client.newBuilder().followRedirects(false).build() }
 
+    /** Override to surface the reader timeline (Android Log) without ever printing cookie values. */
+    protected open fun auroraDiagnostic(message: String) {}
+
     private val readerCoordinator by lazy {
         AuroraReaderCoordinator(
             sourceNameProvider = { name },
@@ -75,6 +81,8 @@ abstract class Aurora : KeiSource() {
             baseHeadersProvider = { headers },
             baseUrlProvider = { baseUrl },
             gateTiming = GateTiming(gateFallbackSeconds, gateTrustsPartnerZero),
+            captchaUnlocksReader = captchaUnlocksReader,
+            diagnostic = { auroraDiagnostic(it) },
             captchaSolver = captchaSolver,
         )
     }

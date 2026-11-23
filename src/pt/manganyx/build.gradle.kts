@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Manga NXY"
-    versionCode = 3
+    versionCode = 4
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
     theme = "aurora"
@@ -26,6 +26,7 @@ extensions.configure<com.android.build.api.dsl.ApplicationExtension> {
 dependencies {
     testImplementation(libs.junit)
     testImplementation(libs.okhttp.core)
+    testImplementation(libs.tachiyomi.lib.v16)
 }
 
 // Unit tests exercise the interceptor, not generated source metadata.

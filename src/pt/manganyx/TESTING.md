@@ -19,6 +19,6 @@ Validação:
 - Primeiras/últimas imagens HTTP 200; navegação e rolagem verificadas.
 - URLs públicas: `/manga/one-piece/1193`, `/1192`, `/1` no mesmo domínio.
 
-Versão final: raw 1 + Aurora 4 = 1.6.5; pública anterior 1.6.4.
+Versão final: raw 1 + Aurora 4 = 1.6.10; pública anterior 1.6.5.
 O sync padrão preserva alterações Nox em `src/` após inclusão no commit;
 não exige lista específica nem impede atualização estrutural da Aurora.

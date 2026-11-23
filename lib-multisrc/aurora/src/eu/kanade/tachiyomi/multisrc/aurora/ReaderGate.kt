@@ -32,9 +32,11 @@ import kotlin.time.TimeSource
 
 private const val GATE_START_ROUTE = "/api/gate/start"
 private const val GATE_UNLOCK_ROUTE = "/api/reader/unlock"
+private const val MAX_UNLOCK_WAIT_SECONDS = 15
 private val CHALLENGE_RETRY_DELAY = 1500.milliseconds
 private val challengeMarkers = listOf("Just a moment", "cf_chl", "challenge-platform", "__cf_chl_opt")
 private val errorReasonRegex = Regex("\"(?:error|message|code)\"\\s*:\\s*\"([A-Za-z0-9_.:-]{1,40})\"")
+private val tooFastSecondsRegex = Regex("\"(?:minWaitSeconds|retryAfter)\"\\s*:\\s*(\\d+)")
 
 /** The app's Cloudflare interceptor answers these; the retry covers a clearance cookie that landed after the request. */
 internal fun Response.isChallenge(): Boolean = header("cf-mitigated")?.equals("challenge", ignoreCase = true) == true ||
@@ -56,6 +58,7 @@ internal fun gateFailure(
     contentType: String?,
     body: String,
     chapterPath: String,
+    trace: String? = null,
 ): Nothing {
     val reason = gateErrorReason(body)
     val kind = when {
@@ -67,7 +70,16 @@ internal fun gateFailure(
         else -> reason ?: "no-reason"
     }
     val media = contentType?.substringBefore(';')?.takeIf { it.isNotBlank() } ?: "no-type"
-    error("Aurora gate $stage: HTTP $code $kind $media $route $chapterPath")
+    // Mihon truncates the tail of a source message, so an unrecognised body leads: it is the only part that can name
+    // the cause. Long token-like runs are redacted and the body is never echoed for the known reasons above.
+    val excerpt = if (kind == "no-reason") {
+        body.replace(Regex("[A-Za-z0-9_.:-]{24,}"), "<redacted>").replace(Regex("\\s+"), " ").trim().take(120)
+    } else {
+        ""
+    }
+    val context = if (trace.isNullOrBlank()) "" else " [$trace]"
+    val detail = "Aurora gate $stage: HTTP $code $kind $media $route$context $chapterPath"
+    error(if (excerpt.isEmpty()) detail else "$excerpt — $detail")
 }
 
 @Serializable
@@ -76,6 +88,10 @@ internal class GateRequest(val returnTo: String)
 /** Second attempt after a `captcha_required`; the token comes from the site's Turnstile widget. */
 @Serializable
 internal class GateCaptchaRequest(val returnTo: String, val captchaToken: String)
+
+/** The reader unlock route names the same Turnstile token `token`. */
+@Serializable
+internal class GateUnlockRequest(val returnTo: String, val token: String)
 
 @Serializable
 internal class GateResponse(val data: GateData)
@@ -193,6 +209,15 @@ internal fun buildGateStartHeaders(headers: Headers, baseUrl: String, chapterUrl
     .set("Sec-Fetch-Site", "same-origin")
     .build()
 
+/** Cookie names only: enough to audit the session, never a value. */
+// Frozen on purpose: the endpoint rejects requests whose User-Agent is not a browser.
+private const val KEY_USER_AGENT =
+    "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+
+internal fun cookieNames(client: OkHttpClient, url: String): String = runCatching {
+    client.cookieJar.loadForRequest(url.toHttpUrl()).map { it.name }.sorted().joinToString(",")
+}.getOrElse { "?" }
+
 internal fun buildGateNavigationHeaders(headers: Headers, chapterUrl: String): Headers = headers.newBuilder()
     .set("Referer", chapterUrl)
     .set("Sec-Fetch-Mode", "navigate")
@@ -206,6 +231,9 @@ internal suspend fun unlockReader(
     headers: Headers,
     timing: GateTiming,
     noRedirectClient: OkHttpClient = client.newBuilder().followRedirects(false).build(),
+    // Off by default: only sites that verify the Turnstile token on the unlock route opt in.
+    captchaUnlocksReader: Boolean = false,
+    diagnostic: (String) -> Unit = {},
     captchaSolver: (suspend (String) -> String)? = null,
     clock: PhaseClock = PhaseClock(),
     // Monotonic "now" shared with the coordinator so a fake clock can drive the countdown in tests.
@@ -234,6 +262,24 @@ internal suspend fun unlockReader(
             .fetch(Fetch.XHR.from(chapterUrl))
             .build()
     }
+    fun unlockRequest(captchaToken: String?): Request {
+        val body = if (captchaToken == null) {
+            GateRequest(chapter.encodedPath).toJsonRequestBody()
+        } else {
+            GateUnlockRequest(chapter.encodedPath, captchaToken).toJsonRequestBody()
+        }
+        return Request.Builder()
+            .url("$baseUrl$GATE_UNLOCK_ROUTE")
+            .headers(gateHeaders)
+            .post(body)
+            .fetch(Fetch.XHR.from(chapterUrl))
+            .build()
+    }
+    val chapterRequest = Request.Builder()
+        .url(chapterUrl)
+        .headers(headers)
+        .fetch(Fetch.DOCUMENT.from(chapterUrl))
+        .build()
 
     var captchaToken: String? = null
     var solvedCaptcha = false
@@ -263,26 +309,17 @@ internal suspend fun unlockReader(
                 clock = clock,
                 elapsed = { currentTime() - attemptStart },
                 execute = execute,
+                diagnostic = diagnostic,
             )
         }
 
         val status = gateResponse.code
+        diagnostic("start status=$status host=${chapter.host} cookies=[${cookieNames(client, "$baseUrl/")}]")
         val contentType = gateResponse.header("Content-Type")
         val errorBody = gateResponse.use { it.body.string() }
         if (status == 400 && "gate_disabled" in errorBody) {
-            val unlockRequest = Request.Builder()
-                .url("$baseUrl$GATE_UNLOCK_ROUTE")
-                .headers(gateHeaders)
-                .post(GateRequest(chapter.encodedPath).toJsonRequestBody())
-                .fetch(Fetch.XHR.from(chapterUrl))
-                .build()
-            execute(client, unlockRequest, false).close()
-            val docRequest = Request.Builder()
-                .url(chapterUrl)
-                .headers(headers)
-                .fetch(Fetch.DOCUMENT.from(chapterUrl))
-                .build()
-            return execute(client, docRequest, false)
+            execute(client, unlockRequest(captchaToken), false).close()
+            return execute(client, chapterRequest, false)
         }
 
         // The app, not the edge, asks for a human check; the page answers it with its own Turnstile widget and
@@ -292,13 +329,66 @@ internal suspend fun unlockReader(
         if (needsCaptcha && captchaSolver != null && !solvedCaptcha) {
             clock.mark("captcha-required")
             solvedCaptcha = true
-            captchaToken = captchaSolver.invoke(chapterUrl)
+            // Turnstile tokens are host-bound: mint on the host that answers the gate, not on a redirecting mirror.
+            val solverUrl = if (captchaUnlocksReader) canonicalReaderUrl(client, chapterUrl, headers, execute) else chapterUrl
+            captchaToken = captchaSolver.invoke(solverUrl)
             clock.mark("captcha-solved")
+            // Retry the start with the token: on these sites that 200 is what issues the session the reader key
+            // needs, so spending the token on the unlock first leaves the images unauthorized.
             continue
+        }
+        // Some sites accept the Turnstile token only on the unlock route, not on the gate start retry.
+        if (needsCaptcha && captchaToken != null && captchaUnlocksReader) {
+            val unlock = execute(client, unlockRequest(captchaToken), false)
+            if (unlock.isSuccessful) {
+                unlock.close()
+                return execute(client, chapterRequest, false)
+            }
+            var unlockStatus = unlock.code
+            var unlockType = unlock.header("Content-Type")
+            var unlockBody = unlock.use { it.body.string() }
+            val waitSeconds = tooFastSecondsRegex.find(unlockBody)?.groupValues?.get(1)?.toIntOrNull()
+            if ("too_fast" in unlockBody && waitSeconds != null) {
+                wait(minOf(waitSeconds, MAX_UNLOCK_WAIT_SECONDS).seconds)
+                val retry = execute(client, unlockRequest(captchaToken), false)
+                if (retry.isSuccessful) {
+                    retry.close()
+                    return execute(client, chapterRequest, false)
+                }
+                unlockStatus = retry.code
+                unlockType = retry.header("Content-Type")
+                unlockBody = retry.use { it.body.string() }
+            }
+            // The gate start that sent us here already refused this same token, so name it: the unlock line alone
+            // would look like the only rejection.
+            gateFailure(
+                "unlock",
+                GATE_UNLOCK_ROUTE,
+                unlockStatus,
+                unlockType,
+                unlockBody,
+                chapter.encodedPath,
+                trace = "start=$status/${reason ?: "no-reason"}",
+            )
         }
         gateFailure("start", GATE_START_ROUTE, status, contentType, errorBody, chapter.encodedPath)
     }
 }
+
+/** Follows the mirror redirect once so the captcha is solved on the origin the app later talks to. */
+private suspend fun canonicalReaderUrl(
+    client: OkHttpClient,
+    chapterUrl: String,
+    headers: Headers,
+    execute: suspend (OkHttpClient, Request, Boolean) -> Response,
+): String = runCatching {
+    val request = Request.Builder()
+        .url(chapterUrl)
+        .headers(headers)
+        .fetch(Fetch.DOCUMENT.from(chapterUrl))
+        .build()
+    execute(client, request, false).use { it.request.url.toString() }
+}.getOrDefault(chapterUrl)
 
 internal suspend fun completeGate(
     gate: GateData,
@@ -313,6 +403,7 @@ internal suspend fun completeGate(
     execute: suspend (OkHttpClient, Request, Boolean) -> Response = { c, req, ensureSuccess ->
         c.call(req, ensureSuccess)
     },
+    diagnostic: (String) -> Unit = {},
 ): Response {
     val issued = TimeSource.Monotonic.markNow()
     val elapsedSinceIssue: () -> Duration = elapsed ?: { issued.elapsedNow() }
@@ -351,6 +442,10 @@ internal suspend fun completeGate(
     }
     clock.mark("gate-callback")
     val gateError = callbackResponse.request.url.queryParameter("gate_error")
+    diagnostic(
+        "callback status=${callbackResponse.code} host=${callbackResponse.request.url.host} " +
+            "error=${gateError ?: "-"} cookies=[${cookieNames(client, callbackResponse.request.url.toString())}]",
+    )
     if (gateError != null) {
         callbackResponse.close()
         error("Aurora gate callback: gate_error=${gateError.take(40)} ${chapterUrl.toHttpUrl().encodedPath}")
@@ -375,6 +470,8 @@ internal class AuroraReaderCoordinator(
     private val callExecutor: suspend (OkHttpClient, Request, Boolean) -> Response = { client, request, ensureSuccess ->
         client.call(request, ensureSuccess)
     },
+    private val captchaUnlocksReader: Boolean = false,
+    private val diagnostic: (String) -> Unit = {},
     private val captchaSolver: (suspend (String) -> String)? = null,
 ) {
     private val gateMutex = Mutex()
@@ -389,6 +486,10 @@ internal class AuroraReaderCoordinator(
 
     @Volatile
     private var cachedKey: KeyDto? = null
+
+    /** Host that actually served the chapter, so follow-up XHRs stop going to the redirecting mirror. */
+    @Volatile
+    private var canonicalOrigin: String? = null
 
     private val chapterCache = Collections.synchronizedMap(
         object : LinkedHashMap<String, CachedChapter>(MAX_CACHED_CHAPTERS, 0.75f, true) {
@@ -410,6 +511,8 @@ internal class AuroraReaderCoordinator(
         var status = 0
         fun read(response: Response): ReaderPayload = response.use {
             status = it.code
+            // The mirror redirects to the canonical host, and only that host answers the key route.
+            if (captchaUnlocksReader) canonicalOrigin = "${it.request.url.scheme}://${it.request.url.host}"
             extractReader(it.body.string(), it.header("Content-Type").orEmpty(), chapterUrl).also { payload ->
                 counts[payload.format] = payload.urls.size
             }
@@ -449,6 +552,8 @@ internal class AuroraReaderCoordinator(
                     headers = readerHeaders(entryUrl, rsc = false),
                     timing = gateTiming,
                     noRedirectClient = noRedirectClientProvider(),
+                    captchaUnlocksReader = captchaUnlocksReader,
+                    diagnostic = diagnostic,
                     captchaSolver = captchaSolver,
                     clock = clock,
                     now = { elapsedSinceProvider(0L) },
@@ -491,15 +596,35 @@ internal class AuroraReaderCoordinator(
 
         return keyMutex.withLock {
             cachedKey?.takeIf { it.v == v && it.e == e }?.let { return@withLock it.k }
-            val request = Request.Builder()
-                .url("${baseUrlProvider()}/api/atfield/key?v=$v&e=$e")
+            val base = if (captchaUnlocksReader) canonicalOrigin ?: baseUrlProvider() else baseUrlProvider()
+            val builder = Request.Builder()
+                .url("$base/api/atfield/key?v=$v&e=$e")
                 .headers(baseHeadersProvider())
-                .fetch(Fetch.XHR.from(chapterUrl))
-                .build()
+            // Proven on the site for these sites only: the key answers 403 unauthorized without a browser User-Agent,
+            // the chapter Referer and the fetch headers, and 200 with them, for the very same cookies.
+            if (captchaUnlocksReader) {
+                builder
+                    .header("User-Agent", KEY_USER_AGENT)
+                    .header("Referer", chapterUrl)
+                    .header("Accept", "*/*")
+                    .header("Sec-Fetch-Site", "same-origin")
+                    .header("Sec-Fetch-Mode", "cors")
+                    .header("Sec-Fetch-Dest", "empty")
+            }
+            val request = builder.build()
             val response = callExecutor(clientProvider(), request, false)
+            val keyCookies = cookieNames(clientProvider(), request.url.toString())
+            diagnostic(
+                "key host=${request.url.host} status=${response.code} ua=${request.header("User-Agent")?.take(24)} " +
+                    "secfetch=${request.header("Sec-Fetch-Site")} cookies=[$keyCookies]",
+            )
             if (!response.isSuccessful) {
                 val errorBody = response.use { it.body.string() }
-                error("Aurora reader key: $chapterUrl status=${response.code} error=${errorBody.take(100)}")
+                // Body first: Mihon truncates the tail of a source message.
+                error(
+                    "${errorBody.take(80)} — Aurora reader key ${request.url.host}${request.url.encodedPath} " +
+                        "status=${response.code} cookies=[$keyCookies] chapter=${chapterUrl.toHttpUrl().encodedPath}",
+                )
             }
             val dto = response.use { it.parseAs<KeyDto>() }
             KeyDto(k = dto.k, v = dto.v ?: v, e = dto.e ?: e).also { cachedKey = it }.k
