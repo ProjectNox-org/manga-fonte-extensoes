@@ -47,7 +47,16 @@ internal fun normalizePageUrl(raw: String, chapterUrl: String): String? {
     return url.toString()
 }
 
-internal fun readerFailure(source: String, chapterUrl: String, status: Int, counts: Map<String, Int>): Nothing {
+internal fun readerFailure(
+    source: String,
+    chapterUrl: String,
+    status: Int,
+    counts: Map<String, Int>,
+    phases: String = "",
+): Nothing {
     val safeUrl = chapterUrl.toHttpUrl().newBuilder().query(null).fragment(null).build()
-    error("Aurora reader: $source $safeUrl status=$status ${counts.entries.joinToString { "${it.key}=${it.value}" }}")
+    error(
+        "Aurora reader: $source $safeUrl status=$status ${counts.entries.joinToString { "${it.key}=${it.value}" }}" +
+            phases.takeIf { it.isNotEmpty() }?.let { " $it" }.orEmpty(),
+    )
 }

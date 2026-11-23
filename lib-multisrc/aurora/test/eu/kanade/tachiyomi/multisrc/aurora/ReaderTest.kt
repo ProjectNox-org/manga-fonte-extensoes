@@ -123,11 +123,23 @@ class ReaderTest {
 
     @Test
     fun gateStartPayloadParsesCorrectly() {
-        val json = """{"data":{"token":"37247fa8-d40d-457f-a784-500fe4a4f1f4","returnTo":"/manga/series/54.2","minWaitSeconds":10}}"""
+        val json = """{"data":{"token":"37247fa8-d40d-457f-a784-500fe4a4f1f4","returnTo":"/manga/series/54.2","minWaitSeconds":10,"gateUrl":"https://reader.example/gate/link/abc"}}"""
         val response = json.parseAs<GateResponse>()
         assertEquals("37247fa8-d40d-457f-a784-500fe4a4f1f4", response.data.token)
         assertEquals("/manga/series/54.2", response.data.returnTo)
         assertEquals(10, response.data.minWaitSeconds)
+        assertEquals("https://reader.example/gate/link/abc", response.data.gateUrl)
+    }
+
+    @Test
+    fun gateStartPayloadWithoutReturnToStillBuildsTheCallback() {
+        val json = """{"data":{"token":"37247fa8-d40d-457f-a784-500fe4a4f1f4","gateUrl":"https://reader.example/gate/link/abc"}}"""
+        val gate = json.parseAs<GateResponse>().data
+        assertNull(gate.returnTo)
+        assertEquals(
+            "https://reader.example/gate/callback?token=37247fa8-d40d-457f-a784-500fe4a4f1f4",
+            gate.callback(chapterUrl).toString(),
+        )
     }
 
     @Test
@@ -143,9 +155,9 @@ class ReaderTest {
     }
 
     @Test
-    fun gateCallbackHeadersIncludeChapterReferer() {
+    fun gateNavigationHeadersIncludeChapterReferer() {
         val base = Headers.headersOf("User-Agent", "TestAgent")
-        val headers = buildGateCallbackHeaders(base, chapterUrl)
+        val headers = buildGateNavigationHeaders(base, chapterUrl)
         assertEquals(chapterUrl, headers["Referer"])
         assertEquals("navigate", headers["Sec-Fetch-Mode"])
         assertEquals("document", headers["Sec-Fetch-Dest"])
