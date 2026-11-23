@@ -434,6 +434,12 @@ class LycanToonsTest {
     }
 
     @Test
+    fun theBlockedMessageNamesTheThirdPartyAppPolicy() {
+        // The site's own block page says third-party apps are not authorised, so the message must say it too.
+        assertTrue(ANTI_ABUSE_ERROR_MESSAGE.contains("terceiros"))
+    }
+
+    @Test
     fun isAntiAbuseBlockDetectsPartialKeywords() {
         assertTrue(isAntiAbuseBlock("Acesso bloqueado temporariamente"))
         assertTrue(isAntiAbuseBlock("Bloqueado — LycanToons"))

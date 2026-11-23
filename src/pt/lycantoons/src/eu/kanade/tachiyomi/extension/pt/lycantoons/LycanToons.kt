@@ -133,6 +133,11 @@ abstract class LycanToons : KeiSource() {
                 html = body
             } else {
                 System.err.println("[LycanToons] getPopularManga (/ranking/obras): HTTP ${response.code}")
+                // 403/429/503 is the site's own anti-abuse answer. Falling back to the WebView or to
+                // another endpoint right after it is what turns a warning into a longer ban.
+                if (response.code == 403 || response.code == 429 || response.code == 503) {
+                    throw LycanAntiAbuseException()
+                }
             }
         } catch (e: LycanAntiAbuseException) {
             throw e
@@ -958,7 +963,8 @@ fun isImageResource(request: Request): Boolean {
 
 class LycanAntiAbuseException(message: String = ANTI_ABUSE_ERROR_MESSAGE) : IOException(message)
 
-const val ANTI_ABUSE_ERROR_MESSAGE = "Acesso temporariamente bloqueado pela proteção anti-abuso da Lycan Toons. Aguarde alguns minutos antes de tentar novamente no aplicativo."
+const val ANTI_ABUSE_ERROR_MESSAGE = "A Lycan Toons bloqueia conexões vindas de aplicativos e extensões de terceiros, " +
+    "que o site não autoriza. O acesso é liberado de novo sozinho depois de um tempo; aguarde antes de tentar novamente."
 
 fun isAntiAbuseBlock(body: String): Boolean = body.contains("Acesso bloqueado temporariamente", ignoreCase = true) ||
     body.contains("Bloqueado — LycanToons", ignoreCase = true) ||
@@ -1145,7 +1151,7 @@ class LycanToonsInterceptor(private val baseUrl: String) : okhttp3.Interceptor {
         if (!isImageReq && (response.code == 403 || response.code == 429)) {
             val peekedBody = runCatching { response.peekBody(4096).string() }.getOrNull().orEmpty()
             if (isAntiAbuseBlock(peekedBody)) {
-                LycanCircuitBreaker.trip(10)
+                LycanCircuitBreaker.trip(30)
                 LycanTrafficLog.markBlocked()
                 System.err.println("[LycanToons] HTTP ${response.code} em ${request.url.encodedPath}: Bloqueio anti-abuso detectado pelo site. Circuit breaker ativado por 10 minutos. Tráfego até aqui: ${LycanTrafficLog.summary()}")
                 throw LycanAntiAbuseException()
@@ -1160,7 +1166,7 @@ class LycanToonsInterceptor(private val baseUrl: String) : okhttp3.Interceptor {
             System.err.println("[LycanToons] CDN HTTP 403 Forbidden em ${request.url.encodedPath}")
             val peeked = runCatching { response.peekBody(1024).string() }.getOrNull().orEmpty()
             if (isAntiAbuseBlock(peeked)) {
-                LycanCircuitBreaker.trip(10)
+                LycanCircuitBreaker.trip(30)
                 LycanTrafficLog.markBlocked()
                 System.err.println("[LycanToons] CDN HTTP 403 contém bloqueio anti-abuso. Ativando circuit breaker por 10 minutos. Tráfego até aqui: ${LycanTrafficLog.summary()}")
             }
