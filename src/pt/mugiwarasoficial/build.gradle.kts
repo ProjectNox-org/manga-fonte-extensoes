@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Mugiwaras Oficial"
-    versionCode = 60
+    versionCode = 61
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
     theme = "aurora"

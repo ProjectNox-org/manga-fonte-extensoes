@@ -610,6 +610,10 @@ internal class AuroraReaderCoordinator(
                     .header("Sec-Fetch-Site", "same-origin")
                     .header("Sec-Fetch-Mode", "cors")
                     .header("Sec-Fetch-Dest", "empty")
+            } else {
+                // Proven on device: without the page-fetch identity this endpoint answers 403, so the key request
+                // stays a fetch of the chapter page.
+                builder.fetch(Fetch.XHR.from(chapterUrl))
             }
             val request = builder.build()
             val response = callExecutor(clientProvider(), request, false)
