@@ -82,6 +82,10 @@ internal object Reader {
         if (AesGcmReader.present(document)) return AesGcmReader.extract(document)
         // The new CSS/data-d reader coexists with an RC4 decoy; prioritize its actual payload.
         if (CssReader.present(document)) return CssReader.extract(document)
+        ReaderData.from(document)?.let { readerData ->
+            val pages = normalize(readerData.toPageUrls(), document)
+            if (pages.isNotEmpty()) return pages
+        }
         if (hasSecureReader(document)) {
             return secureReaderPages(document)
                 ?: throw PagesNotFound("secure-payload-invalid")
@@ -154,6 +158,66 @@ internal object Reader {
             else -> "no-image-candidates"
         }
         throw PagesNotFound(category)
+    }
+
+    /**
+     * Returns the URL of the chapter reader iframe (`3xyaoi-leitor/player.php`) when present on the
+     * chapter page, validating same-origin `http(s)` URLs without embedded credentials.
+     */
+    fun playerIframeUrl(document: Document): String? {
+        val base = document.baseUri().toHttpUrlOrNull() ?: return null
+        val iframe = document.selectFirst("iframe[src*=player.php], .reading-content iframe[src]") ?: return null
+        val raw = iframe.attr("src").trim()
+        val resolved = base.resolve(raw)?.takeIf {
+            (it.scheme == "http" || it.scheme == "https") &&
+                it.host == base.host &&
+                it.username.isEmpty() &&
+                it.password.isEmpty()
+        } ?: return null
+        return resolved.toString()
+    }
+
+    /**
+     * Extracts page image URLs from a `3xyaoi-leitor/player.php` iframe document, preserving
+     * `data-index` / DOM order and token query parameters such as `img.php?t=...`.
+     */
+    fun extractPlayerPages(document: Document): List<String> {
+        val base = document.baseUri().toHttpUrlOrNull() ?: return emptyList()
+        val wrappers = document.select(".reader-container .page-wrapper, .page-wrapper")
+        val orderedImgs = if (wrappers.isNotEmpty()) {
+            wrappers.withIndex()
+                .sortedWith(
+                    compareBy<IndexedValue<Element>>(
+                        { it.value.attr("data-index").toIntOrNull() ?: Int.MAX_VALUE },
+                        { it.index },
+                    ),
+                )
+                .mapNotNull { it.value.selectFirst("img") }
+        } else {
+            document.select(".reader-container img, img.reader-img, main img, body img")
+        }
+        val attrs = listOf("data-vhash", "data-xsec", "data-src", "data-lazy-src", "data-original", "src")
+        return orderedImgs.mapNotNull { img ->
+            val raw = attrs.firstNotNullOfOrNull { attr ->
+                val value = img.attr(attr).trim()
+                when {
+                    value.isBlank() || value.startsWith("data:") || value.startsWith('#') -> null
+                    attr == "data-vhash" -> VhashReader.decodeUrl(value)
+                    attr == "data-xsec" -> value.reversed()
+                    else -> value
+                }
+            } ?: return@mapNotNull null
+            val cleaned = Parser.unescapeEntities(raw, false).trim().replace("\\/", "/")
+            if (nonUrl.containsMatchIn(cleaned) || cleaned.contains("\${")) return@mapNotNull null
+            val url = base.resolve(cleaned)?.takeIf { it.scheme == "http" || it.scheme == "https" } ?: return@mapNotNull null
+            if (url.encodedPath.trimEnd('/').substringAfterLast('/').equals("warning_app.jpg", ignoreCase = true)) {
+                throw BrowserRestricted()
+            }
+            if (url.username.isNotEmpty() || url.password.isNotEmpty() || noise.containsMatchIn(url.encodedPath)) {
+                return@mapNotNull null
+            }
+            url.toString()
+        }.distinct()
     }
 
     // The site has used both an HTML fragment and a JSON list inside encrypted readers.
