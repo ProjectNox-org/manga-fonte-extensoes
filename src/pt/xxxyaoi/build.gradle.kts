@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "XXX Yaoi"
-    versionCode = 10
+    versionCode = 11
     contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
     theme = "madara"
@@ -20,7 +20,7 @@ keiyoushi {
 android {
     sourceSets.named("test") {
         kotlin.directories.add("test")
-        resources.srcDir("test/fixtures")
+        resources.directories.add("test/fixtures")
     }
 }
 

@@ -1,45 +1,148 @@
 package eu.kanade.tachiyomi.extension.pt.xxxyaoi
 
 import eu.kanade.tachiyomi.multisrc.madara.MadaraNoAjax
-import eu.kanade.tachiyomi.source.model.Filter
+import eu.kanade.tachiyomi.network.HttpException
 import eu.kanade.tachiyomi.source.model.FilterList
+import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.annotation.Source
+import keiyoushi.network.DEFAULT_CACHE_CONTROL
+import keiyoushi.network.Fetch
+import keiyoushi.network.addCookie
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.asJsoup
+import keiyoushi.utils.firstInstance
+import keiyoushi.utils.firstInstanceOrNull
+import keiyoushi.utils.parseAs
+import keiyoushi.utils.toJsonElement
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import okhttp3.CacheControl
 import okhttp3.FormBody
 import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import java.time.format.DateTimeFormatter
 import kotlin.time.Duration.Companion.seconds
 
 @Source
 abstract class XXXYaoi : MadaraNoAjax() {
 
+    override val supportsPostId = false
+
     override val chapterDateFormat = DateTimeFormatter.ofPattern("dd/MM/yyyy")
 
-    override fun OkHttpClient.Builder.configureClient() = rateLimit(3, 1.seconds)
+    override fun OkHttpClient.Builder.configureClient() = apply {
+        interceptors().removeAll { it.javaClass.simpleName == "CloudflareInterceptor" }
+        addInterceptor(ChallengeInterceptor())
+        rateLimit(3, 1.seconds)
+        addCookie { listOfNotNull(libraryConfig?.cookie) }
+    }
 
-    override fun Headers.Builder.configureHeaders() = set("Upgrade-Insecure-Requests", "1")
-        .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        .set("Sec-GPC", "1")
-        .set("Sec-Fetch-User", "?1")
-        .set("Sec-Fetch-Site", "none")
-        .set("Sec-Fetch-Mode", "navigate")
-        .set("Sec-Fetch-Dest", "document")
-        .set("Priority", "u=0, i")
-        .set("Pragma", "no-cache")
+    // Do not leak Origin on GET navigation or override browser-matched headers.
+    override fun Headers.Builder.configureHeaders() = apply {
+        removeAll("Origin")
+    }
+
+    override fun getHomeUrl() = "$baseUrl/biblioteca/"
+
+    override val supportsLatest = true
+
+    /**
+     * `3xyaoi.com` disabled view tracking (`enable_manga_view = "0"`) and aliases `views` /
+     * `rating` / `trending` back to `latest` on `xyaoi_library_filter`. Use the site's real
+     * `new-manga` (*Novidades*) listing here so Popular stays paginated and distinct from Latest
+     * rather than representing an unexposed view ranking.
+     */
+    override suspend fun getPopularManga(page: Int) = libraryPage(page, "new-manga")
+
+    override suspend fun getLatestUpdates(page: Int) = libraryPage(page, "latest")
+
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList) = libraryPage(
+        page = page,
+        orderby = filters.firstInstance<SortFilter>().value,
+        search = query.trim(),
+        status = filters.firstInstance<StatusFilter>().value,
+        genre = filters.firstInstanceOrNull<GenreFilter>()?.value.orEmpty(),
+    )
+
+    private suspend fun libraryPage(
+        page: Int,
+        orderby: String,
+        search: String = "",
+        status: String = "",
+        genre: String = "",
+    ): MangasPage {
+        suspend fun libraryData(refresh: Boolean): LibraryData {
+            val body = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("action", "xyaoi_library_filter")
+                .apply {
+                    libraryConfig(refresh).formFields(page, search, status, genre)
+                        .forEach { (name, value) -> addFormDataPart(name, value) }
+                }
+                .addFormDataPart("search", search)
+                .addFormDataPart("status", status)
+                .addFormDataPart("genre", genre)
+                .addFormDataPart("orderby", orderby)
+                .addFormDataPart("criador", "0")
+                .addFormDataPart("page", page.toString())
+                .build()
+            val url = baseUrl.toHttpUrl().newBuilder()
+                .addPathSegments("wp-admin/admin-ajax.php")
+                .addQueryParameter("action", "xyaoi_library_filter")
+                .build()
+            val response = client.post(url, Fetch.XHR.from("/biblioteca/"), body, ensureSuccess = false)
+            if (!refresh && response.code == 403) {
+                response.close()
+                return libraryData(refresh = true)
+            }
+            if (!response.isSuccessful) {
+                val code = response.code
+                response.close()
+                throw HttpException(code)
+            }
+            return response.parseAs<LibraryResponse>().data
+        }
+
+        val library = libraryData(refresh = false)
+        return MangasPage(
+            parseArchive(library.html.asJsoup(baseUrl)),
+            library.currentPage < library.totalPages,
+        )
+    }
+
+    private val libraryConfigMutex = Mutex()
+
+    @Volatile
+    private var libraryConfig: LibraryConfig? = null
+
+    private suspend fun libraryConfig(refresh: Boolean): LibraryConfig = libraryConfigMutex.withLock {
+        libraryConfig.takeUnless { refresh } ?: run {
+            val document = client.get(
+                "$baseUrl/biblioteca/",
+                Fetch.DOCUMENT,
+                if (refresh) CacheControl.FORCE_NETWORK else DEFAULT_CACHE_CONTROL,
+            ).asJsoup()
+            val container = document.selectFirst("#xyaoi-cards-container")
+            (LibraryConfig.fromContainer(container) ?: error("XXX Yaoi: configuração da biblioteca não encontrada."))
+                .also { libraryConfig = it }
+        }
+    }
 
     override val mangaSubString = "bl"
     override val hiatusStatus = super.hiatusStatus + "hiato"
@@ -47,42 +150,107 @@ abstract class XXXYaoi : MadaraNoAjax() {
     override val mangaDetailsSelectorTitle = ".xyaoi-main-title, h1"
     override val mangaDetailsSelectorAuthor = ".xyaoi-prop-col:has(.xyaoi-prop-label:contains(AUTOR)) a, a[href*=author]"
     override val mangaDetailsSelectorArtist = ".xyaoi-prop-col:has(.xyaoi-prop-label:contains(ARTISTA)) a, a[href*=artist]"
-    override val mangaDetailsSelectorStatus = ".xyaoi-prop-value[class*=status-value-], span:matchesOwn((?i)^status:?$) + span"
-    override val mangaDetailsSelectorDescription = ".xyaoi-synopsis-content, [itemprop=description], [class*=synopsis-content]"
+    override val mangaDetailsSelectorStatus = ".xyaoi-prop-col:has(.xyaoi-prop-label:contains(STATUS)) .xyaoi-prop-value, .xyaoi-prop-value[class*=status-value-], span:matchesOwn((?i)^status:?$) + span"
+    override val mangaDetailsSelectorDescription = ".xyaoi-synopsis-text, .xyaoi-synopsis-content, [itemprop=description], [class*=synopsis-content]"
+    override val mangaDetailsSelectorThumbnail = ".xyaoi-cover-img, div.summary_image img"
 
-    override val mangaDetailsSelectorGenre = ".xyaoi-genres-list a, a[href*='/genero/']"
+    override val mangaDetailsSelectorGenre = ".xyaoi-genres-list a, a[href*='/genero/'], a[rel=tag][href*='?genre=']"
     override val mangaDetailsSelectorTag = "[data-xxxyaoi-no-tags]"
+    override val seriesTypeSelector = ".xyaoi-prop-col:has(.xyaoi-prop-label:contains(TIPO)) .xyaoi-prop-value"
     override val altNameSelector = "[data-xxxyaoi-no-alt-name]"
     override val genreDirectory = "genero"
 
-    override fun searchCardSelector() = ".xyaoi-search-card, .c-tabs-item__content"
+    override fun archiveSelector() = "#xyaoi-cards-container > div, body > div:has(> a:has(img)), .xyaoi-search-card, .c-tabs-item__content"
 
-    override val archiveUrlSelector = "h3 a, .post-title a"
+    override val archiveUrlSelector = "a:has(img), h3 a, .post-title a"
+
+    override fun archiveManga(element: Element, id: String): SManga? {
+        val link = element.selectFirst(archiveUrlSelector) ?: return null
+        val url = link.absUrl("href").toHttpUrlOrNull() ?: return null
+        val segments = url.pathSegments.filter(String::isNotEmpty)
+        if (url.host != baseUrl.toHttpUrl().host || segments.size != 2 || segments.firstOrNull() != mangaSubString) {
+            return null
+        }
+        val titleText = element.selectFirst(".xyaoi-card-details a[href]:not(.xyaoi-chap-link), h2, h3, h4, .post-title a")
+            ?.text()?.takeIf(String::isNotBlank)
+            ?: link.selectFirst("img")?.attr("alt")?.takeIf(String::isNotBlank)
+            ?: link.text().takeIf(String::isNotBlank)
+            ?: return null
+        val mangaPath = url.encodedPath
+        return SManga.create().apply {
+            this.url = mangaPath
+            title = titleText
+            thumbnail_url = element.selectFirst("img")?.let { processThumbnail(imageFromElement(it), true) }
+            memo = mangaMemo(mangaPath, emptyList())
+        }
+    }
 
     override fun parseArchive(document: Document): List<SManga> = super.parseArchive(document).ifEmpty {
-        Layout.cards(document).mapNotNull { card ->
-            val id = card.id ?: return@mapNotNull null
+        Layout.cards(document).map { card ->
             SManga.create().apply {
-                url = id
+                url = card.path
                 title = card.title
                 thumbnail_url = card.image?.let(::imageFromElement)
                 memo = mangaMemo(card.path, emptyList())
             }
         }
-    }
+    }.distinctBy(SManga::url)
 
     override fun parseSearchCards(document: Document): List<SearchCard> = super.parseSearchCards(document).ifEmpty {
         Layout.cards(document).map { SearchCard(it.title, it.path, it.image?.let(::imageFromElement)) }
     }
 
-    override fun parseChapterList(document: Document, mangaPath: String): List<SChapter> = Layout.chapters(document, mangaPath).map { entry ->
-        SChapter.create().apply {
-            url = entry.path.substringBefore('?').trimEnd('/').substringAfterLast('/')
-            name = entry.name
-            date_upload = Layout.absoluteDate(entry.date) ?: parseChapterDate(entry.date)
-            memo = buildJsonObject {
-                put("mangaPath", mangaPath)
-                put("chapterPath", entry.path)
+    override fun parseChapterList(document: Document, mangaPath: String): List<SChapter> {
+        val scan = Layout.property(document, "Scan")?.text()
+            ?.takeIf { it.isNotBlank() && !it.equals("Não informado", ignoreCase = true) }
+        val base = document.location().toHttpUrlOrNull() ?: baseUrl.toHttpUrl()
+        val encodedChapters = document.select("ul.version-chap > li, li.wp-manga-chapter").mapNotNull { rowElement ->
+            val link = rowElement.selectFirst("a")
+            val row = ChapterRow.fromElement(rowElement)
+            val decodedHref = link?.let(ChapterRow::decodedHref)
+            val rawHref = link?.attr("href")?.trim().orEmpty()
+            val candidateUrl = decodedHref
+                ?: rawHref.takeIf { it.isNotEmpty() && !it.startsWith("#") }
+                ?: row?.slug?.let { slug -> "${mangaPath.trimEnd('/')}/$slug/" }
+                ?: return@mapNotNull null
+            val resolved = base.resolve(mangaPath.trimEnd('/') + "/")?.resolve(candidateUrl) ?: return@mapNotNull null
+            if (resolved.host != base.host) return@mapNotNull null
+            val chapterSlug = row?.slug?.takeIf(String::isNotBlank)
+                ?: resolved.encodedPath.trimEnd('/').substringAfterLast('/').takeIf(String::isNotBlank)
+                ?: return@mapNotNull null
+            val chapterName = row?.name?.takeIf(String::isNotBlank)
+                ?: link?.selectFirst(".xyaoi-chapter-name")?.text()?.takeIf(String::isNotBlank)
+                ?: link?.text()?.takeIf(String::isNotBlank)
+                ?: return@mapNotNull null
+            val dateText = rowElement.selectFirst("time[datetime]")?.attr("datetime")
+                ?: rowElement.selectFirst("time, .chapter-release-date, .xyaoi-chapter-date-line")?.text()
+                ?: rowElement.selectFirst("[data-date]")?.attr("data-date")
+            val cleanPath = resolved.newBuilder().removeAllQueryParameters("style").fragment(null).build().let {
+                it.encodedPath + (it.encodedQuery?.let { query -> "?$query" } ?: "")
+            }
+            SChapter.create().apply {
+                url = chapterSlug
+                name = chapterName
+                date_upload = Layout.absoluteDate(dateText) ?: parseChapterDate(dateText)
+                scanlator = scan
+                memo = buildJsonObject {
+                    put("mangaPath", mangaPath)
+                    put("chapterPath", cleanPath)
+                }
+            }
+        }
+        return encodedChapters.ifEmpty {
+            Layout.chapters(document, mangaPath).map { entry ->
+                SChapter.create().apply {
+                    url = entry.path.substringBefore('?').trimEnd('/').substringAfterLast('/')
+                    name = entry.name
+                    date_upload = Layout.absoluteDate(entry.date) ?: parseChapterDate(entry.date)
+                    scanlator = scan
+                    memo = buildJsonObject {
+                        put("mangaPath", mangaPath)
+                        put("chapterPath", entry.path)
+                    }
+                }
             }
         }
     }
@@ -91,7 +259,7 @@ abstract class XXXYaoi : MadaraNoAjax() {
         val inline = mangaPage?.let { parseChapterList(it, mangaPath) }.orEmpty()
         return inline.ifEmpty {
             val url = "$baseUrl${mangaPath.trimEnd('/')}/ajax/chapters/"
-            parseChapterList(client.post(url, xhrHeaders, FormBody.Builder().build()).asJsoup(), mangaPath)
+            parseChapterList(client.post(url, xhrHeaders, Fetch.XHR.from(mangaPath), FormBody.Builder().build()).asJsoup(), mangaPath)
         }.also { check(it.isNotEmpty()) { "XXX Yaoi: capítulos não encontrados (chapter-links-not-found)." } }
     }
 
@@ -119,33 +287,38 @@ abstract class XXXYaoi : MadaraNoAjax() {
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val chapterUrl = getChapterUrl(chapter)
-
         val referer = chapterReferer(chapter, chapterUrl)
-        val first = client.get(chapterUrl, chapterHeaders(referer)).asJsoup()
+        val first = client.get(chapterUrl, Fetch.DOCUMENT.from(referer)).asJsoup()
         val document = if (first.selectFirst("#single-pager") != null) {
             val listUrl = first.location().toHttpUrlOrNull()?.newBuilder()?.setQueryParameter("style", "list")?.build()
                 ?: error("XXX Yaoi: endereço de capítulo inválido.")
-            client.get(listUrl.toString(), chapterHeaders(chapterUrl)).asJsoup()
+            client.get(listUrl, Fetch.DOCUMENT.from(chapterUrl)).asJsoup()
         } else {
             first
         }
-        return Reader.load(document, { super.parsePages(document).mapNotNull(Page::imageUrl) }) { scriptUrl ->
-            client.get(scriptUrl, ensureSuccess = false).use { response ->
-                if (!response.isSuccessful) return@use null
-                val body = response.body
-                if (body.contentLength() > 512_000) return@use null
-                val source = body.source()
-                if (source.request(512_001)) null else source.readUtf8()
+
+        val playerUrl = Reader.playerIframeUrl(document)
+        val imageUrls = if (playerUrl != null) {
+            val playerDoc = client.get(playerUrl, Fetch.DOCUMENT.from(chapterUrl)).asJsoup()
+            Reader.extractPlayerPages(playerDoc).ifEmpty {
+                Reader.load(playerDoc) { scriptUrl -> fetchScriptText(scriptUrl, playerUrl) }
             }
-        }.mapIndexed { index, url -> Page(index, chapterUrl, url) }
+        } else {
+            Reader.load(document, { super.parsePages(document).mapNotNull(Page::imageUrl) }) { scriptUrl ->
+                fetchScriptText(scriptUrl, chapterUrl)
+            }
+        }
+        check(imageUrls.isNotEmpty()) { "XXX Yaoi: nenhuma página encontrada neste capítulo." }
+        return imageUrls.mapIndexed { index, url -> Page(index, chapterUrl, url) }
     }
 
-    private fun chapterHeaders(referer: String): Headers = headersBuilder()
-        .set("Referer", referer)
-        .set("Sec-Fetch-Site", "same-origin")
-        .set("Sec-Fetch-Mode", "navigate")
-        .set("Sec-Fetch-Dest", "document")
-        .build()
+    private suspend fun fetchScriptText(scriptUrl: String, referer: String): String? = client.get(scriptUrl, Fetch.SCRIPT.from(referer), ensureSuccess = false).use { response ->
+        if (!response.isSuccessful) return@use null
+        val body = response.body
+        if (body.contentLength() > 512_000) return@use null
+        val source = body.source()
+        if (source.request(512_001)) null else source.readUtf8()
+    }
 
     private fun chapterReferer(chapter: SChapter, chapterUrl: String): String {
         val mangaPath = (chapter.memo["mangaPath"] as? JsonPrimitive)?.content
@@ -163,18 +336,36 @@ abstract class XXXYaoi : MadaraNoAjax() {
     // Cookies are still supplied by the same source client and its CookieJar.
     override fun getImageRequest(page: Page): Request = buildImageRequest(page, headers["User-Agent"])
 
-    override fun getFilterList(data: JsonElement?) = FilterList(
-        *super.getFilterList(data).toTypedArray(),
-        CompletedFilter(),
-    )
-
-    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList) = if (filters.filterIsInstance<CompletedFilter>().firstOrNull()?.state == true) {
-        archivePage(page, "", "/end/", query)
-    } else {
-        super.getSearchMangaList(page, query, filters)
+    override fun getFilterList(data: JsonElement?): FilterList {
+        val genres = data?.let {
+            try {
+                it.parseAs<List<Genre>>()
+            } catch (_: SerializationException) {
+                null
+            } catch (_: IllegalArgumentException) {
+                null
+            }
+        }.orEmpty()
+        return FilterList(
+            buildList {
+                add(SortFilter())
+                add(StatusFilter())
+                if (genres.isNotEmpty()) add(GenreFilter(genres))
+            },
+        )
     }
 
-    private class CompletedFilter : Filter.CheckBox("Concluídos", false)
+    override suspend fun fetchFilterData(): JsonElement = client.get("$baseUrl/biblioteca/", Fetch.DOCUMENT).asJsoup()
+        .select(".xyaoi-genre-item[data-genre]")
+        .mapNotNull { element ->
+            val slug = element.attr("data-genre").trim().takeIf(String::isNotEmpty) ?: return@mapNotNull null
+            val label = element.selectFirst("> span:not(.xyaoi-genre-count)")?.text()
+                ?: element.ownText().takeIf(String::isNotEmpty)
+                ?: return@mapNotNull null
+            Genre(label, slug)
+        }
+        .distinctBy(Genre::slug)
+        .toJsonElement()
 }
 
 internal fun buildImageRequest(page: Page, userAgent: String?): Request {
