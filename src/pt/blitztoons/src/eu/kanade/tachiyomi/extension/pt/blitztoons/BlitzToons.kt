@@ -7,17 +7,20 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.asJsoup
 import kotlinx.serialization.json.JsonElement
+import okhttp3.CacheControl
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.jsoup.nodes.Document
+import java.io.IOException
 import java.time.Instant
 
 const val BLITZTOONS_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -26,7 +29,11 @@ private val CHAPTER_NUMBER_REGEX = Regex("""(?:Capítulo|Cap\.?|Ch\.?)\s*(\d+(?:
 @Source
 abstract class BlitzToons : KeiSource() {
 
+    @Volatile
+    private var pagesHmacKey: String = DEFAULT_PAGES_HMAC_KEY
+
     override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = apply {
+        addInterceptor(BlitzDataUriInterceptor())
         rateLimit(permits = 2) { it.host == "blitztoons.com" }
     }
 
@@ -126,8 +133,30 @@ abstract class BlitzToons : KeiSource() {
     }
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val doc = client.get("$baseUrl${chapter.url}").asJsoup()
-        return parsePageList(doc)
+        val chapterUrl = "$baseUrl${chapter.url}"
+        val doc = client.get(
+            chapterUrl,
+            Fetch.DOCUMENT,
+            cacheControl = CacheControl.FORCE_NETWORK,
+        ).asJsoup()
+
+        val dynamicPages = extractPagesApiDescriptor(doc, chapterUrl)?.let { descriptor ->
+            fetchDynamicPages(
+                client = client,
+                baseUrl = baseUrl,
+                chapterUrl = chapterUrl,
+                baseHeaders = headers,
+                descriptor = descriptor,
+                cachedKey = pagesHmacKey,
+                onKeyUpdated = { pagesHmacKey = it },
+            )
+        }.orEmpty()
+
+        val pages = dynamicPages.ifEmpty { parsePageList(doc) }
+        if (pages.isEmpty()) {
+            throw IOException("BlitzToons: nenhuma imagem válida encontrada para este capítulo.")
+        }
+        return pages
     }
 
     override fun getFilterList(data: JsonElement?): FilterList = FilterList(
@@ -136,27 +165,6 @@ abstract class BlitzToons : KeiSource() {
         StatusFilter(),
         GenreFilter(),
     )
-}
-
-internal fun buildBlitzImageRequest(imageUrl: String, baseUrl: String, baseHeaders: Headers? = null): Request {
-    val builder = baseHeaders?.newBuilder() ?: Headers.Builder()
-    if (builder["User-Agent"] == null) {
-        builder.set("User-Agent", BLITZTOONS_USER_AGENT)
-    }
-    val finalHeaders = builder
-        .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
-        .set("Sec-Fetch-Dest", "image")
-        .set("Sec-Fetch-Mode", "no-cors")
-        .set("Sec-Fetch-Site", "same-site")
-        .set("Referer", "$baseUrl/")
-        .removeAll("Origin")
-        .build()
-
-    return Request.Builder()
-        .url(imageUrl)
-        .headers(finalHeaders)
-        .get()
-        .build()
 }
 
 internal fun resolveMangaUrl(url: HttpUrl): String? {
@@ -267,16 +275,5 @@ internal fun parseChapterList(doc: Document): List<SChapter> {
             this.chapter_number = chapterNumber
             this.date_upload = uploadDate
         }
-    }
-}
-
-internal fun parsePageList(doc: Document): List<Page> {
-    val pageElements = doc.select("img.page, div.pages img, section.ch-block img")
-
-    return pageElements.mapNotNull { img ->
-        val url = img.attr("abs:src").ifEmpty { img.attr("abs:data-src") }
-        url.takeIf { it.isNotBlank() }
-    }.distinct().mapIndexed { index, imageUrl ->
-        Page(index, imageUrl = imageUrl)
     }
 }
