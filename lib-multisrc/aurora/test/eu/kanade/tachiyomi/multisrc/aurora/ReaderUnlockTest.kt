@@ -1,5 +1,7 @@
 package eu.kanade.tachiyomi.multisrc.aurora
 
+import keiyoushi.network.Fetch
+
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import okhttp3.Cookie
@@ -196,6 +198,31 @@ class ReaderUnlockTest {
         assertTrue(lines.last().endsWith("cookies=[mnx_reader_human]"))
         // Proven on the site: no Referer means 403 unauthorized for the very same cookies.
         assertEquals("https://manganyx.org/manga/gantz/383", keyRequest!!.header("Referer"))
+    }
+
+
+    // Group 2 (Mugiwaras, Brasuka, Leitor): the edge in front of the key answers a challenge the app cannot
+    // bypass unless the request keeps the browser headers that Fetch adds, so it must stay an XHR page fetch.
+    @Test
+    fun `other sites keep the key request a page fetch`() = runBlocking {
+        var keyRequest: Request? = null
+        val coordinator = AuroraReaderCoordinator(
+            sourceNameProvider = { "Mugiwaras Oficial" },
+            clientProvider = { OkHttpClient() },
+            noRedirectClientProvider = { OkHttpClient() },
+            baseHeadersProvider = { Headers.headersOf("User-Agent", "Test/1.0") },
+            baseUrlProvider = { "https://mugiwaras.example" },
+            cookieFlusher = {},
+            wait = {},
+            callExecutor = { _, req, _ ->
+                keyRequest = req
+                jsonResponse(req, 200, """{"v":1,"e":54,"k":"a2V5"}""")
+            },
+        )
+
+        assertEquals("a2V5", coordinator.getKey(1 to 54, "https://mugiwaras.example/manga/series/54.2"))
+        assertEquals(Fetch.Kind.XHR, keyRequest!!.tag(Fetch.Kind::class.java))
+        assertEquals("Test/1.0", keyRequest!!.header("User-Agent"))
     }
 
     private fun client(handler: (Request) -> Response): OkHttpClient = OkHttpClient.Builder()
