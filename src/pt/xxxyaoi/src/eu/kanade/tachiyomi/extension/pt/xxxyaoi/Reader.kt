@@ -32,6 +32,7 @@ internal object Reader {
     private val readerSelector = ".reading-content, .page-break, [id*=reader], [class*=reader], [id*=chapter-images], [class*=chapter-content], [itemprop=articleBody]"
     private val secureKeyAssignment = Regex("""(?s)(?:var|let|const)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*((?:String\.fromCharCode\s*\(\s*\d+\s*-\s*\d+\s*\)\s*\+?\s*)+);?""")
     private val secureKeyPart = Regex("""String\.fromCharCode\s*\(\s*(\d+)\s*-\s*(\d+)\s*\)""")
+    private val rc4DecoyStub = Regex("""function\s+_rc4\s*\([^)]*\)\s*\{\s*return\s+[A-Za-z_$][\w$]*\s*;?\s*\}""")
     private const val BROWSER_RESTRICTION_MESSAGE = "O 3xYaoi bloqueou a leitura deste capítulo em clientes Mihon/Tachiyomi. Abra este capítulo pelo navegador oficial do site."
 
     private class Candidate(val urls: List<String>, val explicit: Boolean)
@@ -42,9 +43,10 @@ internal object Reader {
 
     // Only scripts explicitly declared by the chapter are fetched, and only after local extraction fails.
     suspend fun load(document: Document, madara: () -> List<String> = { emptyList() }, fetchScript: suspend (String) -> String?): List<String> {
-        // The current reader is self-contained. Do not probe unrelated scripts
-        // when its encrypted payload is present but malformed.
-        if (VhashReader.present(document) || AesGcmReader.present(document) || CssReader.present(document) || hasSecureReader(document)) return extract(document, madara)
+        // Self-contained readers do not need unrelated external script probes unless they fail.
+        if (VhashReader.present(document) || AesGcmReader.present(document) || CssReader.present(document) || ReaderData.from(document) != null || hasSecureReader(document)) {
+            return extract(document, madara)
+        }
         val failure = try {
             return extract(document, madara)
         } catch (error: PagesNotFound) {
@@ -78,16 +80,26 @@ internal object Reader {
     }.distinct().sortedByDescending { it.contains("reader", true) || it.contains("chapter", true) }.take(64)
 
     fun extract(document: Document, madara: () -> List<String> = { emptyList() }, externalScripts: List<String> = emptyList()): List<String> {
-        if (VhashReader.present(document)) return VhashReader.extract(document)
-        if (AesGcmReader.present(document)) return AesGcmReader.extract(document)
-        // The new CSS/data-d reader coexists with an RC4 decoy; prioritize its actual payload.
-        if (CssReader.present(document)) return CssReader.extract(document)
-        ReaderData.from(document)?.let { readerData ->
-            val pages = normalize(readerData.toPageUrls(), document)
-            if (pages.isNotEmpty()) return pages
+        var restricted: BrowserRestricted? = null
+        fun <T> guardRestriction(block: () -> T?): T? = try {
+            block()
+        } catch (error: BrowserRestricted) {
+            restricted = restricted ?: error
+            null
         }
+
+        if (VhashReader.present(document)) guardRestriction { VhashReader.extract(document) }?.takeIf(List<String>::isNotEmpty)?.let { return it }
+        if (AesGcmReader.present(document)) guardRestriction { AesGcmReader.extract(document) }?.takeIf(List<String>::isNotEmpty)?.let { return it }
+        // The CSS/data-d or text/plain reader may coexist with an RC4 decoy; prioritize actual payloads.
+        if (CssReader.present(document)) guardRestriction { CssReader.extract(document) }?.takeIf(List<String>::isNotEmpty)?.let { return it }
+        guardRestriction {
+            ReaderData.from(document)?.let { readerData ->
+                normalize(readerData.toPageUrls(), document).takeIf(List<String>::isNotEmpty)
+            }
+        }?.let { return it }
         if (hasSecureReader(document)) {
-            return secureReaderPages(document)
+            return guardRestriction { secureReaderPages(document) }
+                ?: restricted?.let { throw it }
                 ?: throw PagesNotFound("secure-payload-invalid")
         }
         val scripts = (
@@ -118,24 +130,24 @@ internal object Reader {
         }
         val keys = numericKeys + literalKeys
         for (payload in payloads) {
-            jsonPages(payload.toString(Charsets.UTF_8), document, true)?.let { return it.urls }
+            guardRestriction { jsonPages(payload.toString(Charsets.UTF_8), document, true) }?.let { return it.urls }
             for (key in keys) {
                 val first = payload.firstOrNull()?.toInt()?.xor(key[0].toInt())?.toChar()
                 if (first !in listOf('[', '{', '"', ' ', '\n', '\r', '\t')) continue
                 val decoded = ByteArray(payload.size) { i -> (payload[i].toInt() xor key[i % key.size].toInt()).toByte() }
                 // A JSON list/object is mandatory before accepting a guessed key.
-                jsonPages(decoded.toString(Charsets.UTF_8), document, true)?.let { return it.urls }
+                guardRestriction { jsonPages(decoded.toString(Charsets.UTF_8), document, true) }?.let { return it.urls }
             }
         }
         val direct = (attributes + strings + scripts).flatMap { candidate ->
             listOf(candidate) + fragments(candidate)
-        }.mapNotNull { candidate -> jsonPages(candidate, document) }
+        }.mapNotNull { candidate -> guardRestriction { jsonPages(candidate, document) } }
         // Reader HTML beats unrelated image arrays from analytics/configuration scripts.
         val containers = document.select(readerSelector)
-        normalize(containers.flatMap { images(it) }, document).takeIf(List<String>::isNotEmpty)?.let { return it }
+        guardRestriction { normalize(containers.flatMap { images(it) }, document).takeIf(List<String>::isNotEmpty) }?.let { return it }
         // A renamed wrapper still needs a chapter main/article with several plausible page images.
         for (container in document.select("main, article")) {
-            val urls = normalize(images(container), document)
+            val urls = guardRestriction { normalize(images(container), document) } ?: continue
             if (urls.size >= 2) return urls
         }
         val ranked = direct.sortedWith(candidateOrder).distinctBy { it.urls }
@@ -148,10 +160,11 @@ internal object Reader {
         } catch (error: CancellationException) {
             throw error
         } catch (error: BrowserRestricted) {
-            throw error
+            restricted = restricted ?: error
         } catch (_: Exception) {
             // Ignore an unavailable Madara fallback.
         }
+        restricted?.let { throw it }
         val category = when {
             payloads.isNotEmpty() && keys.isEmpty() -> "key-not-found"
             payloads.isNotEmpty() -> "payload-invalid"
@@ -234,16 +247,18 @@ internal object Reader {
             ?: throw PagesNotFound("aes-pages-empty")
     }
 
-    /** XXX Yaoi's current reader mounts pages from an RC4-encrypted text/template vault. */
+    /** XXX Yaoi's legacy RC4 vault reader; ignores no-op `_rc4(k, b) { return b; }` decoy stubs. */
     private fun hasSecureReader(document: Document): Boolean = document.select("script[type=text/template]").any { it.data().contains('~') } &&
         document.select("script:not([src])").any { script ->
-            script.data().contains("_rc4") && script.data().contains("String.fromCharCode")
+            val data = script.data()
+            data.contains("_rc4") && data.contains("String.fromCharCode") && !rc4DecoyStub.containsMatchIn(data)
         }
 
     private fun secureReaderPages(document: Document): List<String>? {
         val templates = document.select("script[type=text/template]").filter { it.data().contains('~') }
         val source = document.select("script:not([src])").firstOrNull { element ->
-            element.data().contains("_rc4") && element.data().contains("String.fromCharCode")
+            val data = element.data()
+            data.contains("_rc4") && data.contains("String.fromCharCode") && !rc4DecoyStub.containsMatchIn(data)
         }?.data() ?: return null
         val expression = secureKeyAssignment.find(source)?.groupValues?.get(1) ?: return null
         val codes = secureKeyPart.findAll(expression).map { match ->

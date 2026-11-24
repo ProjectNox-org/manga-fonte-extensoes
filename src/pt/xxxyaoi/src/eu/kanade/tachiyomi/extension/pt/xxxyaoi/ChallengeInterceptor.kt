@@ -3,58 +3,86 @@ package eu.kanade.tachiyomi.extension.pt.xxxyaoi
 import android.webkit.CookieManager
 import keiyoushi.utils.TURNSTILE_AREA
 import keiyoushi.utils.runWebViewBlocking
+import okhttp3.Call
 import okhttp3.Interceptor
 import okhttp3.Request
 import okhttp3.Response
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimeSource
 
 /**
- * Solves Cloudflare challenges in a hidden WebView while stripping Android WebView's default
- * `X-Requested-With` header for `3xyaoi.com`, which otherwise triggers Cloudflare's hard WAF block
- * ("Sorry, you have been blocked").
+ * Coordinates OkHttp interception with [SessionManager] and WebView-based Cloudflare challenge resolution
+ * while preserving the proactive `X-Requested-With` stripping needed on `3xyaoi.com`.
  */
-class ChallengeInterceptor : Interceptor {
+class ChallengeInterceptor internal constructor(
+    private val sessionManager: SessionManager,
+) : Interceptor {
 
-    private val lock = Any()
+    constructor() : this(createDefaultSessionManager())
 
-    @Volatile
-    private var passes = 0
+    override fun intercept(chain: Interceptor.Chain): Response = sessionManager.interceptWithRecovery(chain.call(), chain.request(), chain::proceed)
 
-    override fun intercept(chain: Interceptor.Chain): Response {
-        val request = chain.request()
-        val passesBefore = passes
-        val response = chain.proceed(request)
-        if (!response.isChallenge()) return response
-        response.close()
-        synchronized(lock) {
-            if (passes == passesBefore) {
-                pass(chain, request)
-                passes++
-            }
-        }
-        return chain.proceed(request)
+    companion object {
+        internal fun createDefaultSessionManager(): SessionManager = SessionManager(
+            solver = WebViewChallengeSolver,
+        )
     }
+}
 
-    private fun pass(chain: Interceptor.Chain, request: Request) {
+internal object WebViewChallengeSolver : ChallengeSolver {
+    private val TIMEOUT = 60.seconds
+    private val POLL_INTERVAL = 250.milliseconds
+    private val SHOW_AFTER = 6.seconds
+
+    override fun solve(call: Call, request: Request, classification: ChallengeClassification): Boolean {
         val origin = "${request.url.scheme}://${request.url.host}"
+        WebViewOriginHeader.ensure(origin)
         val targetUrl = challengeNavigationUrl(request, origin)
+
         try {
-            val previous = clearance(origin)
+            val previousClearance = clearance(origin)
             val started = TimeSource.Monotonic.markNow()
             var shown = false
-            runWebViewBlocking<Unit>(chain.call(), TIMEOUT) {
+            val pageSettledClean = AtomicBoolean(false)
+            val checkInFlight = AtomicBoolean(false)
+
+            runWebViewBlocking<Unit>(call, TIMEOUT) {
                 userAgent = request.header("User-Agent").orEmpty()
                 setOriginMatchedHeader(
                     "X-Requested-With",
                     "",
                     WebViewOriginHeader.originRulesFor(origin).ifEmpty { setOf(origin) },
                 )
+
+                onPageFinished { finishedUrl ->
+                    if (!finishedUrl.startsWith(origin)) return@onPageFinished
+                    if (!checkInFlight.compareAndSet(false, true)) return@onPageFinished
+                    evaluateJs(
+                        """
+                        (function() {
+                          var t = document.title || '';
+                          var h = document.documentElement ? document.documentElement.innerHTML : '';
+                          if (t.indexOf('Just a moment') !== -1 || t.indexOf('Attention Required') !== -1) return 'challenge';
+                          if (h.indexOf('_cf_chl_opt') !== -1 || h.indexOf('Sorry, you have been blocked') !== -1) return 'blocked';
+                          if (document.getElementById('xyaoi-cards-container') || h.indexOf('xyaoi_library_filter') !== -1 || h.indexOf('wp-manga') !== -1 || document.querySelector('.reading-content, .xyaoi-reader-topbar, nav.xyaoi-nav-container')) return 'clean';
+                          return 'unknown';
+                        })()
+                        """.trimIndent(),
+                    ) { result ->
+                        checkInFlight.set(false)
+                        if (result == "\"clean\"" || result == "clean") {
+                            pageSettledClean.set(true)
+                        }
+                    }
+                }
+
                 poll(POLL_INTERVAL) {
-                    val current = clearance(origin)
-                    if (current != null && current != previous) {
+                    val currentClearance = clearance(origin)
+                    val clearanceChanged = currentClearance != null && currentClearance != previousClearance
+                    if (clearanceChanged || pageSettledClean.get()) {
                         resolve(Unit)
                     } else if (!shown && started.elapsedNow() > SHOW_AFTER) {
                         shown = showToUser(TURNSTILE_AREA)
@@ -63,6 +91,7 @@ class ChallengeInterceptor : Interceptor {
                 loadUrl(targetUrl)
             }
             CookieManager.getInstance().flush()
+            return true
         } catch (e: UnsupportedOperationException) {
             throw IOException("Atualize o Android System WebView para passar pela verificação do Cloudflare.", e)
         } catch (e: IOException) {
@@ -72,7 +101,7 @@ class ChallengeInterceptor : Interceptor {
         }
     }
 
-    private fun challengeNavigationUrl(request: Request, origin: String): String {
+    internal fun challengeNavigationUrl(request: Request, origin: String): String {
         val url = request.url
         val path = url.encodedPath.lowercase()
         val isSubresource = path.endsWith(".jpg") ||
@@ -86,35 +115,17 @@ class ChallengeInterceptor : Interceptor {
             path.endsWith(".js")
         if (!isSubresource) return url.toString()
         val referer = request.header("Referer")?.trim()
-        if (!referer.isNullOrEmpty() && referer.startsWith(origin) && !referer.endsWith("img.php")) {
-            return referer
+        if (!referer.isNullOrEmpty() && !referer.endsWith("img.php")) {
+            if (referer.startsWith(origin)) return referer
+            if (referer.startsWith('/')) return "$origin$referer"
         }
         return "$origin/biblioteca/"
     }
 
     private fun clearance(origin: String): String? = CookieManager.getInstance().getCookie(origin)
-        ?.split("; ")
+        ?.split(';')
+        ?.map(String::trim)
         ?.firstOrNull { it.startsWith("cf_clearance=") }
-
-    private fun Response.isChallenge(): Boolean = isCloudflareChallenge()
-
-    companion object {
-        private val TIMEOUT = 60.seconds
-        private val POLL_INTERVAL = 250.milliseconds
-        private val SHOW_AFTER = 6.seconds
-    }
 }
 
-internal fun Response.isCloudflareChallenge(): Boolean {
-    if (code != 403 && code != 503) return false
-    if (header("cf-mitigated") == "challenge") return true
-    val snippet = try {
-        peekBody(8192).string()
-    } catch (_: IOException) {
-        ""
-    }
-    return snippet.contains("_cf_chl_opt") ||
-        snippet.contains("cf-turnstile") ||
-        snippet.contains("/cdn-cgi/challenge-platform") ||
-        snippet.contains("Just a moment")
-}
+internal fun Response.isCloudflareChallenge(): Boolean = CloudflareClassifier.classifyResponse(this) != ChallengeClassification.CLEAN
