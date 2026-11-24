@@ -40,7 +40,9 @@ class LibraryData(
 )
 
 /**
- * Decodes the dynamic anti-scraping configuration embedded on `#xyaoi-cards-container`.
+ * Decodes the dynamic anti-scraping configuration embedded on the library container or script.
+ * Supports `JsonArray` (e.g. `xy2$` / unprefixed), `JsonObject` (e.g. `v3~` with `f0..c9` or
+ * script-mapped custom keys), and forward/reversed Base64 encodings.
  */
 class LibraryConfig(values: JsonArray) {
     private val tokenField = values[0].string
@@ -71,44 +73,71 @@ class LibraryConfig(values: JsonArray) {
     )
 
     companion object {
-        private val INLINE_CFG_REGEX = Regex("""(?:_xyCfg|var\s+[A-Za-z_$][\w$]*)\s*=\s*(\[[^\]]+\])""")
-        private val JS_STRING_ARG_REGEX = Regex("""["'](xy\d+\$[^"']{16,}|[A-Za-z0-9+/=_-]{32,})["']""")
+        private val CANONICAL_OBJECT_KEYS = listOf("f0", "f1", "f2", "n3", "n4", "n5", "n6", "n7", "c8", "c9")
+        private val INLINE_CFG_REGEX = Regex("""(?:_xyCfg|(?:var|let|const)\s+[A-Za-z_$][\w$]*)\s*=\s*(\[[^\]]+\])""")
+        private val SCRIPT_OBJECT_MAP_REGEX = Regex("""\b(?:_xyCfg|[A-Za-z_$][\w$]*)\s*=\s*\[([^\]]{10,600})\]""")
+        private val OBJECT_PROP_ACCESS_REGEX = Regex("""([A-Za-z_$][\w$]*)\s*(?:\.\s*([A-Za-z_$][\w$]*)|\[\s*["']([^"']+)["']\s*\])""")
+        private val JS_STRING_ARG_REGEX = Regex("""["']((?:xy|v)\d+[$~:|#!][^"']{16,}|[A-Za-z0-9+/=_-]{32,})["']""")
+        private val PREFIXED_ATTR_REGEX = Regex("""^[A-Za-z0-9_-]{1,16}[$~:|#!].{16,}$""")
+        private val VERSION_PREFIX_MARKER = Regex("""\b(?:xy|v)\d+[$~:|#!]""")
 
-        fun fromContainer(container: Element?): LibraryConfig? {
+        fun fromContainer(container: Element?): LibraryConfig? = fromContainer(container, null)
+
+        internal fun fromContainer(container: Element?, scriptKeyOrder: List<String>?): LibraryConfig? {
             if (container == null) return null
             return container.attributes()
                 .filter { it.key.startsWith("data-") && it.value.isNotBlank() }
                 .sortedByDescending { it.key.startsWith("data-xy") }
-                .firstNotNullOfOrNull { attr -> decodeArrayConfig(attr.value) }
+                .firstNotNullOfOrNull { attr -> decodeConfigValue(attr.value, scriptKeyOrder) }
         }
 
         fun fromDocument(document: Document): LibraryConfig? {
-            fromContainer(document.selectFirst("#xyaoi-cards-container"))?.let { return it }
+            val scriptKeyOrder = extractScriptKeyOrder(document)
+
+            fromContainer(document.selectFirst("#xyaoi-cards-container"), scriptKeyOrder)?.let { return it }
 
             val fallbackContainers = document.select(".xyaoi-cards-grid, [id*=cards-container], [class*=cards-grid]")
-            fallbackContainers.firstNotNullOfOrNull(::fromContainer)?.let { return it }
+            fallbackContainers.firstNotNullOfOrNull { fromContainer(it, scriptKeyOrder) }?.let { return it }
 
-            document.select("[data-xy-o], [data-xy-q], [class*=cards] [data-xy], [data-xy]")
-                .firstNotNullOfOrNull(::fromContainer)
+            document.select("[data-xy-o], [data-xy-q], [data-xy-l], [class*=cards] [data-xy], [data-xy]")
+                .firstNotNullOfOrNull { fromContainer(it, scriptKeyOrder) }
                 ?.let { return it }
 
-            // Fallback: inspect any element carrying a `data-xy-*` attribute before full document scan.
+            // Fallback: inspect any element carrying a `data-xy*`, version-prefixed, or encoded `data-*` payload attribute.
             for (el in document.allElements) {
-                val xyAttr = el.attributes().firstOrNull { it.key.startsWith("data-xy") && it.value.isNotBlank() }
-                if (xyAttr != null) {
-                    decodeArrayConfig(xyAttr.value)?.let { return it }
-                }
+                val candidates = el.attributes()
+                    .filter { attr ->
+                        val trimmed = attr.value.trim()
+                        attr.key.startsWith("data-") &&
+                            trimmed.length >= 24 &&
+                            (
+                                attr.key.startsWith("data-xy") ||
+                                    PREFIXED_ATTR_REGEX.matches(trimmed) ||
+                                    trimmed.startsWith('{') ||
+                                    trimmed.startsWith('[') ||
+                                    trimmed.all { ch -> ch.isLetterOrDigit() || ch in "+/=_-\r\n\t " }
+                                )
+                    }
+                    .sortedByDescending { it.key.startsWith("data-xy") || PREFIXED_ATTR_REGEX.matches(it.value.trim()) }
+                candidates.firstNotNullOfOrNull { attr ->
+                    decodeConfigValue(attr.value, scriptKeyOrder)
+                }?.let { return it }
             }
 
-            // Fallback: inline script embedding `_xyCfg = [...]` or encoded config literal.
+            // Fallback: inline script embedding config array (`[...]`) or encoded config literal.
             for (script in document.select("script:not([src])")) {
                 val data = script.data()
-                if (!data.contains("_xyCfg") && !data.contains("xyaoi_library_filter") && !data.contains("xy2$")) continue
+                val looksRelevant = data.contains("_xyCfg") ||
+                    data.contains("xyaoi_library_filter") ||
+                    data.contains("admin-ajax.php") ||
+                    VERSION_PREFIX_MARKER.containsMatchIn(data) ||
+                    (data.contains("xyaoi") && data.contains("library") && data.contains("filter"))
+                if (!looksRelevant) continue
                 INLINE_CFG_REGEX.findAll(data).firstNotNullOfOrNull { match ->
-                    parseConfigArray(match.groupValues[1])
+                    parseConfigPayload(match.groupValues[1], scriptKeyOrder)
                 }?.let { return it }
                 JS_STRING_ARG_REGEX.findAll(data).firstNotNullOfOrNull { match ->
-                    decodeArrayConfig(match.groupValues[1])
+                    decodeConfigValue(match.groupValues[1], scriptKeyOrder)
                 }?.let { return it }
             }
             return null
@@ -117,49 +146,96 @@ class LibraryConfig(values: JsonArray) {
         fun diagnose(document: Document): String {
             val text = document.text()
             val html = document.html()
-            return when {
-                html.contains("_cf_chl_opt") || html.contains("cf-turnstile") || html.contains("/cdn-cgi/challenge-platform") ->
-                    "cloudflare-challenge"
-                document.selectFirst("#xyaoi-noscript-wall") != null && document.selectFirst("#xyaoi-cards-container") == null ->
-                    "noscript-wall"
-                text.isBlank() -> "empty-document"
-                document.selectFirst("#xyaoi-cards-container, .xyaoi-cards-grid") == null ->
-                    "missing-container"
-                else -> "config-parse-failed"
+            return when (CloudflareClassifier.classifyHtml(200, html)) {
+                ChallengeClassification.WAF_BLOCK -> "waf-blocked"
+                ChallengeClassification.INTERACTIVE_CHALLENGE,
+                ChallengeClassification.CHALLENGE_REDIRECT,
+                -> "cloudflare-challenge"
+                ChallengeClassification.CLEAN -> when {
+                    document.selectFirst("#xyaoi-noscript-wall") != null &&
+                        document.selectFirst("#xyaoi-cards-container, .xyaoi-cards-grid, [id*=cards-container], [class*=cards-grid]") == null ->
+                        "noscript-wall"
+                    text.isBlank() -> "empty-document"
+                    document.selectFirst("#xyaoi-cards-container, .xyaoi-cards-grid, [id*=cards-container], [class*=cards-grid]") == null ->
+                        "missing-container"
+                    else -> "config-parse-failed"
+                }
             }
         }
 
-        private fun decodeArrayConfig(raw: String): LibraryConfig? {
-            val trimmed = raw.trim()
-            if (trimmed.isEmpty()) return null
-            if (trimmed.startsWith('[')) {
-                parseConfigArray(trimmed)?.let { return it }
-            }
-            val candidates = buildList {
-                add(trimmed)
-                stripPayloadPrefix(trimmed)?.let(::add)
-            }.distinct()
-            for (candidate in candidates) {
-                decodeReversedBase64Safe(candidate)?.let(::parseConfigArray)?.let { return it }
-                decodePlainBase64Safe(candidate)?.let(::parseConfigArray)?.let { return it }
+        internal fun extractScriptKeyOrder(document: Document): List<String>? {
+            for (script in document.select("script:not([src])")) {
+                val data = script.data()
+                if (!data.contains('[')) continue
+                for (match in SCRIPT_OBJECT_MAP_REGEX.findAll(data)) {
+                    val items = match.groupValues[1].split(',')
+                    if (items.size != 10) continue
+                    val pairs = items.mapNotNull { item ->
+                        val propMatch = OBJECT_PROP_ACCESS_REGEX.find(item.trim()) ?: return@mapNotNull null
+                        val receiver = propMatch.groupValues[1]
+                        val prop = propMatch.groupValues[2].ifEmpty { propMatch.groupValues[3] }.trim().takeIf(String::isNotEmpty)
+                            ?: return@mapNotNull null
+                        receiver to prop
+                    }
+                    if (pairs.size == 10 && pairs.map { it.first }.distinct().size == 1) {
+                        val keys = pairs.map { it.second }
+                        if (keys.distinct().size == 10) return keys
+                    }
+                }
             }
             return null
         }
 
-        private fun parseConfigArray(raw: String): LibraryConfig? = parseOrNull {
-            val array = raw.trim().parseAs<JsonArray>()
-            if (array.size >= 10 &&
-                array[0] is JsonPrimitive &&
-                array[1] is JsonPrimitive &&
-                array[2] is JsonPrimitive &&
-                array[3].let { it is JsonPrimitive && it.intOrNull != null } &&
-                array[8] is JsonPrimitive &&
-                array[9] is JsonPrimitive
-            ) {
-                LibraryConfig(array).takeIf(LibraryConfig::isUsable)
-            } else {
-                null
+        private fun decodeConfigValue(raw: String, scriptKeyOrder: List<String>?): LibraryConfig? {
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) return null
+            if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+                parseConfigPayload(trimmed, scriptKeyOrder)?.let { return it }
             }
+            val candidates = buildList {
+                stripPayloadPrefix(trimmed)?.let(::add)
+                add(trimmed)
+            }.distinct()
+            for (candidate in candidates) {
+                // Newest format (`v3~`): reverse string BEFORE Base64 decode.
+                decodeReversedPayloadBase64Safe(candidate)?.let { parseConfigPayload(it, scriptKeyOrder) }?.let { return it }
+                // Legacy/unreversed Base64.
+                decodePlainBase64Safe(candidate)?.let { parseConfigPayload(it, scriptKeyOrder) }?.let { return it }
+                // Earlier `xy2$` / `data-xy-*` format: Base64 decode FIRST, then reverse string.
+                decodeReversedBase64Safe(candidate)?.let { parseConfigPayload(it, scriptKeyOrder) }?.let { return it }
+            }
+            return null
+        }
+
+        private fun parseConfigPayload(raw: String, scriptKeyOrder: List<String>?): LibraryConfig? = parseOrNull {
+            when (val element = raw.trim().parseAs<JsonElement>()) {
+                is JsonArray -> parseArrayElement(element)
+                is JsonObject -> parseObjectElement(element, scriptKeyOrder)
+                else -> null
+            }
+        }
+
+        private fun parseArrayElement(array: JsonArray): LibraryConfig? {
+            if (array.size < 10) return null
+            val stringsValid = listOf(0, 1, 2, 8, 9).all { idx ->
+                array[idx].let { it is JsonPrimitive && it.isString && it.content.isNotBlank() }
+            }
+            val intsValid = (3..7).all { idx ->
+                array[idx].let { it is JsonPrimitive && !it.isString && it.intOrNull != null }
+            }
+            if (!stringsValid || !intsValid) return null
+            return LibraryConfig(array).takeIf(LibraryConfig::isUsable)
+        }
+
+        private fun parseObjectElement(obj: JsonObject, scriptKeyOrder: List<String>?): LibraryConfig? {
+            val keyOrderCandidates = listOfNotNull(scriptKeyOrder, CANONICAL_OBJECT_KEYS)
+            for (keys in keyOrderCandidates) {
+                if (keys.size == 10 && keys.all { it in obj }) {
+                    val mapped = JsonArray(keys.map { obj.getValue(it) })
+                    parseArrayElement(mapped)?.let { return it }
+                }
+            }
+            return null
         }
     }
 }
@@ -175,9 +251,7 @@ class ChapterRow(values: JsonArray) {
         fun fromElement(element: Element): ChapterRow? = element.attributes()
             .filter { it.key.startsWith("data-") && it.value.isNotBlank() }
             .firstNotNullOfOrNull { attr ->
-                parseOrNull {
-                    val decoded = attr.value.decodeReversedBase64()
-                    val array = decoded.parseAs<JsonArray>()
+                decodeChapterJsonArray(attr.value)?.let { array ->
                     if (array.size >= 3 && array[1] is JsonPrimitive && array[2] is JsonPrimitive) {
                         ChapterRow(array)
                     } else {
@@ -189,8 +263,16 @@ class ChapterRow(values: JsonArray) {
         fun decodedHref(link: Element): String? = link.attributes()
             .filter { it.key.startsWith("data-") && it.value.isNotBlank() }
             .firstNotNullOfOrNull { attr ->
-                parseOrNull { attr.value.decodeReversedBase64().trim() }
-                    ?.takeIf { it.startsWith("https://") || it.startsWith("http://") || it.startsWith('/') }
+                decodeAnyTextVariants(attr.value)
+                    .map(String::trim)
+                    .firstOrNull { it.startsWith("https://") || it.startsWith("http://") || it.startsWith('/') }
+            }
+
+        private fun decodeChapterJsonArray(raw: String): JsonArray? = decodeAnyTextVariants(raw)
+            .firstNotNullOfOrNull { candidate ->
+                val trimmed = candidate.trim()
+                if (!trimmed.startsWith('[')) return@firstNotNullOfOrNull null
+                parseOrNull { trimmed.parseAs<JsonArray>() }
             }
     }
 }
@@ -199,23 +281,48 @@ class ChapterRow(values: JsonArray) {
 class Genre(val name: String, val slug: String)
 
 /**
- * Decoder for the `script[type=application/json]` / `script[type=text/x-xy-data]` inline reader format.
+ * Decoder for obfuscated inline reader payloads (`text/plain`, `application/json`, `text/x-xy-data`,
+ * `text/template`, or script-referenced data blocks) used by `3xyaoi.com`.
  */
 class ReaderData(
     private val key: String,
     private val payload: List<String>,
     private val offset: Int,
-    private val shift: Int,
-    private val mods: List<Int>,
+    private val shiftDelta: Int,
+    private val mods: List<SignedMod>,
     private val xorMask: Int = 0,
+    private val entryOrder: EntryOrder = EntryOrder.BASE64_THEN_REVERSE,
 ) {
-    fun toPageUrls(): List<String> = payload.drop(offset).map { entry ->
-        val reversed = Base64.getDecoder().decode(entry.filterNot(Char::isWhitespace)).reversedArray()
-        val bytes = ByteArray(reversed.size) { i ->
-            val shifted = (reversed[i].toInt() and 0xFF) - shift - mods.sumOf { i % it }
-            ((shifted and 0xFF) xor key[i % key.length].code xor xorMask).toByte()
+    data class SignedMod(val sign: Int, val modulus: Int)
+
+    enum class EntryOrder {
+        BASE64_THEN_REVERSE,
+        REVERSE_THEN_BASE64,
+        BASE64_ONLY,
+    }
+
+    fun toPageUrls(): List<String> = payload.drop(offset).mapNotNull { entry ->
+        decodeEntry(entry, entryOrder)?.takeIf { url ->
+            url.startsWith("https://") || url.startsWith("http://") || url.startsWith("//") || url.startsWith('/')
         }
-        try {
+    }
+
+    private fun decodeEntry(entry: String, order: EntryOrder): String? {
+        val compact = entry.filterNot(Char::isWhitespace)
+        if (compact.isEmpty()) return null
+        val rawBytes = parseOrNull {
+            when (order) {
+                EntryOrder.BASE64_THEN_REVERSE -> decodeBase64Flexible(compact).reversedArray()
+                EntryOrder.REVERSE_THEN_BASE64 -> decodeBase64Flexible(compact.reversed())
+                EntryOrder.BASE64_ONLY -> decodeBase64Flexible(compact)
+            }
+        } ?: return null
+        val bytes = ByteArray(rawBytes.size) { i ->
+            val modSum = mods.sumOf { it.sign * (i % it.modulus) }
+            val transformed = (rawBytes[i].toInt() and 0xFF) + shiftDelta + modSum
+            ((transformed and 0xFF) xor key[i % key.length].code xor xorMask).toByte()
+        }
+        return try {
             Charsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString()
         } catch (_: CharacterCodingException) {
             String(bytes, Charsets.ISO_8859_1)
@@ -223,12 +330,17 @@ class ReaderData(
     }
 
     companion object {
-        private val TRANSFORM_REGEX = Regex("""(?:charCodeAt|codePointAt)\(\s*([A-Za-z_$][\w$]*)\s*\)(?:\s*\+\s*256)?(.*?)\)\s*(?:&\s*255|%\s*256)""")
-        private val XOR_AFTER_REGEX = Regex("""[A-Za-z_$][\w$]*\.(?:charCodeAt|codePointAt)\([^)]+\)\s*\^\s*(0[xX][0-9a-fA-F]+|\d+)""")
-        private val XOR_BEFORE_REGEX = Regex("""(0[xX][0-9a-fA-F]+|\d+)\s*\^\s*[A-Za-z_$][\w$]*\.(?:charCodeAt|codePointAt)\([^)]+\)""")
-        private val KEY_FIELD_REGEX = Regex("""[A-Za-z_$][\w$]*key[\w$]*\s*=\s*[A-Za-z_$][\w$]*\s*\[\s*["']([^"']+)["']\s*]""", RegexOption.IGNORE_CASE)
-        private val SLICE_FIELDS_REGEX = Regex("""([A-Za-z_$][\w$]*)\s*\[\s*["']([^"']+)["']\s*]\s*\.slice\(\s*\1\s*\[\s*["']([^"']+)["']\s*]\s*\)""")
-        private val TERM_REGEX = Regex("""-\s*(0[xX][0-9a-fA-F]+|[A-Za-z0-9_$]+)""")
+        private val TRANSFORM_REGEX = Regex("""(?:charCodeAt|codePointAt)\(\s*([A-Za-z_$][\w$]*)\s*\)(.*?)\)\s*(?:&\s*255|%\s*256)""")
+        private val XOR_AFTER_REGEX = Regex("""(?:[A-Za-z_$][\w$]*(?:\s*(?:\.\s*[A-Za-z_$][\w$]*|\[\s*["'][^"']+["']\s*\]))*)\s*\.(?:charCodeAt|codePointAt)\([^)]+\)\s*\^\s*(0[xX][0-9a-fA-F]+|\d+|[A-Za-z_$][\w$]*)""")
+        private val XOR_BEFORE_REGEX = Regex("""(0[xX][0-9a-fA-F]+|\d+|[A-Za-z_$][\w$]*)\s*\^\s*(?:[A-Za-z_$][\w$]*(?:\s*(?:\.\s*[A-Za-z_$][\w$]*|\[\s*["'][^"']+["']\s*\]))*)\s*\.(?:charCodeAt|codePointAt)\([^)]+\)""")
+        private val XOR_KEY_VAR_REGEX = Regex("""([A-Za-z_$][\w$]*)(?:\s*(?:\.\s*([A-Za-z_$][\w$]*)|\[\s*["']([^"']+)["']\s*\]))?\s*\.(?:charCodeAt|codePointAt)\([^)]*\)""")
+        private val KEY_FIELD_REGEX = Regex("""[A-Za-z_$][\w$]*key[\w$]*\s*=\s*[A-Za-z_$][\w$]*\s*(?:\[\s*["']([^"']+)["']\s*\]|\.\s*([A-Za-z_$][\w$]*))""", RegexOption.IGNORE_CASE)
+        private val SLICE_FIELDS_REGEX = Regex("""([A-Za-z_$][\w$]*)\s*(?:\[\s*["']([^"']+)["']\s*\]|\.\s*([A-Za-z_$][\w$]*))\s*\.slice\(\s*\1\s*(?:\[\s*["']([^"']+)["']\s*\]|\.\s*([A-Za-z_$][\w$]*))\s*\)""")
+        private val SLICE_LITERAL_REGEX = Regex("""([A-Za-z_$][\w$]*)\s*(?:\[\s*["']([^"']+)["']\s*\]|\.\s*([A-Za-z_$][\w$]*))\s*\.slice\(\s*(\d+)\s*\)""")
+        private val TERM_REGEX = Regex("""([+-])\s*(0[xX][0-9a-fA-F]+|\d+|[A-Za-z_$][\w$]*)""")
+        private val GET_ELEMENT_BY_ID_LITERAL = Regex("""getElementById\(\s*["']([^"']+)["']\s*\)""")
+        private val GET_ELEMENT_BY_ID_CONCAT = Regex("""getElementById\(\s*([A-Za-z_$][\w$]*)\s*\+\s*["']([^"']+)["']\s*\)""")
+        private val DECOY_URL_MARKER = Regex("""(?:warning_app\.jpg|http\.cat/)""", RegexOption.IGNORE_CASE)
 
         private fun parseNumericLiteral(token: String): Int? = if (token.startsWith("0x", ignoreCase = true)) {
             token.drop(2).toIntOrNull(16)
@@ -236,56 +348,180 @@ class ReaderData(
             token.toIntOrNull()
         }
 
-        fun from(document: Document): ReaderData? {
-            val html = document.html()
-            val transformMatch = TRANSFORM_REGEX.find(html) ?: return null
-            val loopVar = Regex.escape(transformMatch.groupValues[1])
-            val transform = transformMatch.groupValues[2]
-            val modRegex = Regex("""\(\s*$loopVar\s*%\s*(\d+)\s*\)""")
-            val shift = TERM_REGEX.findAll(modRegex.replace(transform, "")).sumOf { term ->
-                val token = term.groupValues[1]
-                parseNumericLiteral(token)
-                    ?: Regex("""(?:var|let|const)\s+${Regex.escape(token)}\s*=\s*(0[xX][0-9a-fA-F]+|\d+)""")
-                        .find(html)?.groupValues?.get(1)?.let(::parseNumericLiteral)
-                    ?: return null
-            }
-            val mods = modRegex.findAll(transform).mapNotNull { it.groupValues[1].toIntOrNull()?.takeIf { m -> m > 0 } }.toList()
-            val xorMask = (
-                XOR_AFTER_REGEX.find(html)?.groupValues?.get(1)
-                    ?: XOR_BEFORE_REGEX.find(html)?.groupValues?.get(1)
-                )?.let(::parseNumericLiteral) ?: 0
-            val keyField = KEY_FIELD_REGEX.find(html)?.groupValues?.get(1)
-            val sliceMatch = SLICE_FIELDS_REGEX.find(html)
-            val payloadField = sliceMatch?.groupValues?.get(2)
-            val offsetField = sliceMatch?.groupValues?.get(3)
+        private fun resolveNumericToken(token: String, scriptScope: String): Int? = parseNumericLiteral(token)
+            ?: Regex("""\b(?:var|let|const)\s+(?:[^;\n]*,\s*)?${Regex.escape(token)}\s*=\s*(0[xX][0-9a-fA-F]+|\d+)\b""")
+                .find(scriptScope)?.groupValues?.get(1)?.let(::parseNumericLiteral)
 
-            return document.select("script[type=application/json], script[type=text/x-xy-data]")
-                .firstNotNullOfOrNull { script ->
-                    val jsonObject = parsePayloadObject(script.data()) ?: return@firstNotNullOfOrNull null
-                    val key = (keyField?.let { jsonObject[it] as? JsonPrimitive }?.takeIf(JsonPrimitive::isString)?.content)
-                        ?.takeIf(String::isNotEmpty)
-                        ?: jsonObject.values
-                            .filterIsInstance<JsonPrimitive>()
-                            .filter(JsonPrimitive::isString)
-                            .map(JsonPrimitive::content)
-                            .filter(String::isNotEmpty)
-                            .maxByOrNull(String::length)
-                        ?: return@firstNotNullOfOrNull null
-                    val payload = (payloadField?.let { jsonObject[it] as? JsonArray })
-                        ?: jsonObject.values.filterIsInstance<JsonArray>().maxByOrNull(JsonArray::size)
-                        ?: return@firstNotNullOfOrNull null
-                    val offset = (offsetField?.let { (jsonObject[it] as? JsonPrimitive)?.takeUnless(JsonPrimitive::isString)?.intOrNull })
-                        ?: jsonObject.values.firstNotNullOfOrNull { (it as? JsonPrimitive)?.takeUnless(JsonPrimitive::isString)?.intOrNull }
-                        ?: return@firstNotNullOfOrNull null
-                    parseOrNull {
-                        ReaderData(
-                            key = key,
-                            payload = payload.map { it.string },
-                            offset = offset,
-                            shift = shift,
-                            mods = mods,
-                            xorMask = xorMask,
-                        ).takeIf { it.toPageUrls().isNotEmpty() }
+        fun from(document: Document): ReaderData? {
+            val inlineScripts = document.select("script:not([src])").map { it.data() }
+            val candidatesScripts = inlineScripts.filter {
+                (it.contains("codePointAt") || it.contains("charCodeAt")) &&
+                    (it.contains("& 255") || it.contains("% 256") || it.contains("256"))
+            }.ifEmpty { listOf(document.html()) }
+
+            val candidateElements = orderedPayloadElements(document, candidatesScripts)
+            if (candidateElements.isEmpty()) return null
+
+            for (scriptScope in candidatesScripts) {
+                val parsed = extractTransformParams(scriptScope) ?: continue
+                for (element in candidateElements) {
+                    val raw = element.data().ifBlank { element.text() }
+                    val jsonObject = parsePayloadObject(raw) ?: continue
+                    buildReaderData(jsonObject, scriptScope, parsed)?.let { return it }
+                }
+            }
+            return null
+        }
+
+        private class TransformParams(
+            val shiftDelta: Int,
+            val mods: List<SignedMod>,
+            val xorMask: Int,
+            val keyField: String?,
+            val payloadField: String?,
+            val offsetField: String?,
+            val literalOffset: Int?,
+            val entryOrder: EntryOrder,
+        )
+
+        private fun extractTransformParams(scriptScope: String): TransformParams? {
+            val transformMatch = TRANSFORM_REGEX.find(scriptScope) ?: return null
+            val loopVar = Regex.escape(transformMatch.groupValues[1])
+            val rawTransform = transformMatch.groupValues[2]
+            val modRegex = Regex("""([+-])\s*\(?\s*$loopVar\s*%\s*(\d+)\s*\)?""")
+            val mods = modRegex.findAll(rawTransform).mapNotNull { match ->
+                val mod = match.groupValues[2].toIntOrNull()?.takeIf { it > 0 } ?: return@mapNotNull null
+                val sign = if (match.groupValues[1] == "-") -1 else 1
+                SignedMod(sign, mod)
+            }.toList()
+
+            val stripped = modRegex.replace(rawTransform, "")
+                .replace(Regex("""\+\s*256\b"""), "")
+            var shiftDelta = 0
+            for (term in TERM_REGEX.findAll(stripped)) {
+                val sign = if (term.groupValues[1] == "-") -1 else 1
+                val value = resolveNumericToken(term.groupValues[2], scriptScope) ?: return null
+                shiftDelta += sign * value
+            }
+
+            val xorToken = XOR_AFTER_REGEX.find(scriptScope)?.groupValues?.get(1)
+                ?: XOR_BEFORE_REGEX.find(scriptScope)?.groupValues?.get(1)
+            val xorMask = xorToken?.let { resolveNumericToken(it, scriptScope) } ?: 0
+
+            val directKeyField = XOR_KEY_VAR_REGEX.findAll(scriptScope)
+                .mapNotNull { m -> m.groupValues[2].ifEmpty { m.groupValues[3] }.takeIf(String::isNotEmpty) }
+                .firstOrNull()
+            val keyVarName = XOR_KEY_VAR_REGEX.findAll(scriptScope)
+                .filter { it.groupValues[2].isEmpty() && it.groupValues[3].isEmpty() }
+                .map { it.groupValues[1] }
+                .firstOrNull { name ->
+                    Regex("""\b(?:var|let|const)\s+(?:[^;\n]*,\s*)?${Regex.escape(name)}\s*=\s*[A-Za-z_$][\w$]*\s*(?:\[\s*["'][^"']+["']\s*\]|\.\s*[A-Za-z_$][\w$]*)""")
+                        .containsMatchIn(scriptScope)
+                }
+            val keyField = directKeyField
+                ?: keyVarName?.let { varName ->
+                    Regex("""\b(?:var|let|const)\s+(?:[^;\n]*,\s*)?${Regex.escape(varName)}\s*=\s*[A-Za-z_$][\w$]*\s*(?:\[\s*["']([^"']+)["']\s*\]|\.\s*([A-Za-z_$][\w$]*))""")
+                        .find(scriptScope)?.let { m -> m.groupValues[1].ifEmpty { m.groupValues[2] } }
+                }
+                ?: KEY_FIELD_REGEX.find(scriptScope)?.let { m -> m.groupValues[1].ifEmpty { m.groupValues[2] } }
+
+            val sliceMatch = SLICE_FIELDS_REGEX.find(scriptScope)
+            val literalSliceMatch = if (sliceMatch == null) SLICE_LITERAL_REGEX.find(scriptScope) else null
+            val entryOrder = when {
+                Regex("""atob\(\s*(?:_rev|split\(['"]{2}\)\.reverse)""").containsMatchIn(scriptScope) -> EntryOrder.REVERSE_THEN_BASE64
+                scriptScope.contains("reverse", ignoreCase = true) -> EntryOrder.BASE64_THEN_REVERSE
+                else -> EntryOrder.BASE64_ONLY
+            }
+
+            return TransformParams(
+                shiftDelta = shiftDelta,
+                mods = mods,
+                xorMask = xorMask,
+                keyField = keyField,
+                payloadField = sliceMatch?.let { m -> m.groupValues[2].ifEmpty { m.groupValues[3] } }
+                    ?: literalSliceMatch?.let { m -> m.groupValues[2].ifEmpty { m.groupValues[3] } },
+                offsetField = sliceMatch?.let { m -> m.groupValues[4].ifEmpty { m.groupValues[5] } },
+                literalOffset = literalSliceMatch?.groupValues?.get(4)?.toIntOrNull(),
+                entryOrder = entryOrder,
+            )
+        }
+
+        private fun orderedPayloadElements(document: Document, scripts: List<String>): List<Element> {
+            val referencedIds = buildList {
+                for (script in scripts) {
+                    GET_ELEMENT_BY_ID_LITERAL.findAll(script).forEach { add(it.groupValues[1]) }
+                    GET_ELEMENT_BY_ID_CONCAT.findAll(script).forEach { match ->
+                        val prefixVar = Regex.escape(match.groupValues[1])
+                        val suffix = match.groupValues[2]
+                        Regex("""\b(?:var|let|const)\s+$prefixVar\s*=\s*["']([^"']+)["']""")
+                            .find(script)?.groupValues?.get(1)?.let { prefix -> add(prefix + suffix) }
+                    }
+                }
+            }.distinct()
+
+            val prioritized = referencedIds.mapNotNull(document::getElementById)
+            val fallbackScripts = document.select("script[type]").filter { el ->
+                val t = el.attr("type").lowercase()
+                t.isNotBlank() && "javascript" !in t && "ecmascript" !in t && "module" !in t && "importmap" !in t
+            }
+            val nonScriptContainers = document.select("template[id], textarea[id]")
+            return (prioritized + fallbackScripts + nonScriptContainers).distinct()
+        }
+
+        private fun buildReaderData(jsonObject: JsonObject, scriptScope: String, params: TransformParams): ReaderData? {
+            val key = (params.keyField?.let { jsonObject[it] as? JsonPrimitive }?.takeIf(JsonPrimitive::isString)?.content)
+                ?.takeIf(String::isNotEmpty)
+                ?: jsonObject.values
+                    .filterIsInstance<JsonPrimitive>()
+                    .filter(JsonPrimitive::isString)
+                    .map(JsonPrimitive::content)
+                    .filter { it.length >= 8 }
+                    .maxByOrNull(String::length)
+                ?: return null
+            val payloadArray = (params.payloadField?.let { jsonObject[it] as? JsonArray })
+                ?: jsonObject.values.filterIsInstance<JsonArray>().maxByOrNull(JsonArray::size)
+                ?: return null
+            val entries = payloadArray.mapNotNull { (it as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.content }
+            if (entries.isEmpty()) return null
+
+            val explicitOffset = params.offsetField?.let {
+                (jsonObject[it] as? JsonPrimitive)?.takeUnless(JsonPrimitive::isString)?.intOrNull
+            } ?: params.literalOffset
+            if (explicitOffset != null) {
+                return buildValidated(key, entries, explicitOffset.coerceIn(0, entries.size), params)
+            }
+
+            // Without an explicit slice field, prefer an offset matching a decoy prefix, then fallback ints.
+            val intOffsets = jsonObject.values
+                .mapNotNull { (it as? JsonPrimitive)?.takeUnless(JsonPrimitive::isString)?.intOrNull }
+                .filter { it in 1 until entries.size }
+                .distinct()
+            for (offset in intOffsets) {
+                val candidate = buildValidated(key, entries, offset, params) ?: continue
+                val prefix = ReaderData(key, entries.take(offset), 0, params.shiftDelta, params.mods, params.xorMask, params.entryOrder).toPageUrls()
+                if (prefix.lastOrNull()?.let { DECOY_URL_MARKER.containsMatchIn(it) } == true) return candidate
+            }
+            for (offset in intOffsets + listOf(0)) {
+                buildValidated(key, entries, offset, params)?.let { return it }
+            }
+            return null
+        }
+
+        private fun buildValidated(key: String, entries: List<String>, offset: Int, params: TransformParams): ReaderData? = parseOrNull {
+            listOf(params.entryOrder, EntryOrder.BASE64_THEN_REVERSE, EntryOrder.REVERSE_THEN_BASE64, EntryOrder.BASE64_ONLY)
+                .distinct()
+                .firstNotNullOfOrNull { order ->
+                    ReaderData(
+                        key = key,
+                        payload = entries,
+                        offset = offset,
+                        shiftDelta = params.shiftDelta,
+                        mods = params.mods,
+                        xorMask = params.xorMask,
+                        entryOrder = order,
+                    ).takeIf { data ->
+                        val urls = data.toPageUrls()
+                        urls.isNotEmpty() && urls.none { DECOY_URL_MARKER.containsMatchIn(it) }
                     }
                 }
         }
@@ -298,7 +534,8 @@ class ReaderData(
             }
             val compact = (stripPayloadPrefix(trimmed) ?: trimmed).filterNot(Char::isWhitespace)
             return (
-                decodeReversedBase64Safe(compact.reversed())?.let { parseOrNull { it.reversed().parseAs<JsonElement>() } }
+                decodeReversedPayloadBase64Safe(compact)?.let { parseOrNull { it.parseAs<JsonElement>() } }
+                    ?: decodeReversedBase64Safe(compact.reversed())?.let { parseOrNull { it.reversed().parseAs<JsonElement>() } }
                     ?: parseOrNull { decodeBase64Flexible(compact.reversed()).decodeToString().parseAs<JsonElement>() }
                     ?: decodeReversedBase64Safe(compact)?.let { parseOrNull { it.parseAs<JsonElement>() } }
                     ?: decodePlainBase64Safe(compact)?.let { parseOrNull { it.parseAs<JsonElement>() } }
@@ -307,7 +544,7 @@ class ReaderData(
     }
 }
 
-private val PAYLOAD_PREFIX_REGEX = Regex("""^[A-Za-z0-9_-]{1,24}\$(.+)$""", RegexOption.DOT_MATCHES_ALL)
+private val PAYLOAD_PREFIX_REGEX = Regex("""^[A-Za-z0-9_-]{1,24}[$~:|#!](.+)$""", RegexOption.DOT_MATCHES_ALL)
 
 internal fun stripPayloadPrefix(value: String): String? = PAYLOAD_PREFIX_REGEX.matchEntire(value.trim())?.groupValues?.get(1)?.trim()?.takeIf(String::isNotEmpty)
 
@@ -322,8 +559,28 @@ internal fun decodeReversedBase64Safe(raw: String): String? = parseOrNull {
     decodeBase64Flexible(raw).decodeToString().reversed()
 }
 
+internal fun decodeReversedPayloadBase64Safe(raw: String): String? = parseOrNull {
+    decodeBase64Flexible(raw.reversed()).decodeToString()
+}
+
 internal fun decodePlainBase64Safe(raw: String): String? = parseOrNull {
     decodeBase64Flexible(raw).decodeToString()
+}
+
+internal fun decodeAnyTextVariants(raw: String): List<String> {
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty()) return emptyList()
+    val candidates = listOfNotNull(stripPayloadPrefix(trimmed), trimmed).distinct()
+    return buildList {
+        for (candidate in candidates) {
+            if (candidate.startsWith('[') || candidate.startsWith('{') || candidate.startsWith("http") || candidate.startsWith('/')) {
+                add(candidate)
+            }
+            decodeReversedBase64Safe(candidate)?.let(::add)
+            decodeReversedPayloadBase64Safe(candidate)?.let(::add)
+            decodePlainBase64Safe(candidate)?.let(::add)
+        }
+    }.distinct()
 }
 
 private inline fun <T> parseOrNull(block: () -> T): T? = try {
@@ -335,8 +592,8 @@ private inline fun <T> parseOrNull(block: () -> T): T? = try {
 }
 
 /**
- * Decodes `atob(value).split('').reverse().join('')` strings used by `3xyaoi.com`,
- * stripping optional versioned prefixes such as `xy2$`.
+ * Decodes `atob(value).split('').reverse().join('')` or prefix-wrapped Base64 strings used by
+ * `3xyaoi.com`, stripping optional versioned prefixes such as `xy2$` or `v3~`.
  */
 fun String.decodeReversedBase64(): String {
     val payload = stripPayloadPrefix(this) ?: this

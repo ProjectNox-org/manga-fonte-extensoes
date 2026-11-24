@@ -49,14 +49,16 @@ abstract class XXXYaoi : MadaraNoAjax() {
 
     override val chapterDateFormat = DateTimeFormatter.ofPattern("dd/MM/yyyy")
 
+    private val sessionManager = ChallengeInterceptor.createDefaultSessionManager()
+
     override fun OkHttpClient.Builder.configureClient() = apply {
         WebViewOriginHeader.ensure(baseUrl)
         interceptors().removeAll { it.javaClass.simpleName == "CloudflareInterceptor" }
-        addInterceptor(ChallengeInterceptor())
+        addInterceptor(ChallengeInterceptor(sessionManager))
         addInterceptor(TransientRetryInterceptor())
         addInterceptor(ImageContentInterceptor())
         rateLimit(3, 1.seconds)
-        addCookie { listOfNotNull(libraryConfig?.cookie) }
+        addCookie { listOfNotNull(libraryConfigState?.config?.cookie) }
     }
 
     override val imageFetch: Fetch get() = Fetch.IMAGE
@@ -99,8 +101,9 @@ abstract class XXXYaoi : MadaraNoAjax() {
         status: String = "",
         genre: String = "",
     ): MangasPage {
-        suspend fun libraryData(refresh: Boolean): LibraryData {
-            val config = libraryConfig(refresh)
+        suspend fun libraryData(refresh: Boolean, failedGeneration: Long?): LibraryData {
+            val state = libraryConfig(refresh, failedGeneration)
+            val config = state.config
             val body = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
                 .addFormDataPart("action", "xyaoi_library_filter")
@@ -122,66 +125,102 @@ abstract class XXXYaoi : MadaraNoAjax() {
             val response = client.post(url, Fetch.XHR.from("/biblioteca/"), body, ensureSuccess = false)
             if (!refresh && (response.code == 403 || response.code == 400)) {
                 response.close()
-                libraryConfig = null
-                return libraryData(refresh = true)
+                sessionManager.markPossiblyExpired()
+                return libraryData(refresh = true, failedGeneration = state.generation)
             }
             if (!response.isSuccessful) {
                 val code = response.code
                 response.close()
-                if (code == 403) libraryConfig = null
+                if (code == 403) {
+                    sessionManager.markPossiblyExpired()
+                    invalidateLibraryConfig(state.generation)
+                }
                 throw HttpException(code)
             }
             val parsed = try {
                 response.parseAs<LibraryResponse>().toLibraryData()
             } catch (e: SerializationException) {
                 if (!refresh) {
-                    libraryConfig = null
-                    return libraryData(refresh = true)
+                    sessionManager.markPossiblyExpired()
+                    return libraryData(refresh = true, failedGeneration = state.generation)
                 }
                 throw IllegalStateException("XXX Yaoi: resposta inválida da biblioteca (json-invalid).", e)
             }
             if (parsed == null) {
                 if (!refresh) {
-                    libraryConfig = null
-                    return libraryData(refresh = true)
+                    sessionManager.markPossiblyExpired()
+                    return libraryData(refresh = true, failedGeneration = state.generation)
                 }
                 error("XXX Yaoi: catálogo rejeitou os parâmetros da biblioteca (ajax-rejected).")
             }
             return parsed
         }
 
-        val library = libraryData(refresh = false)
+        val library = libraryData(refresh = false, failedGeneration = null)
         return MangasPage(
             parseArchive(library.html.asJsoup(baseUrl)),
             library.currentPage < library.totalPages,
         )
     }
 
+    private class CachedLibraryConfig(
+        val config: LibraryConfig,
+        val generation: Long,
+    )
+
     private val libraryConfigMutex = Mutex()
 
     @Volatile
-    private var libraryConfig: LibraryConfig? = null
+    private var libraryConfigState: CachedLibraryConfig? = null
 
-    private suspend fun libraryConfig(refresh: Boolean): LibraryConfig = libraryConfigMutex.withLock {
-        libraryConfig.takeUnless { refresh } ?: run {
-            suspend fun fetchConfig(forceNetwork: Boolean): Pair<Document, LibraryConfig?> {
-                val document = client.get(
-                    "$baseUrl/biblioteca/",
-                    Fetch.DOCUMENT,
-                    if (forceNetwork) CacheControl.FORCE_NETWORK else DEFAULT_CACHE_CONTROL,
-                ).asJsoup()
-                return document to LibraryConfig.fromDocument(document)
-            }
-
-            var (document, config) = fetchConfig(forceNetwork = refresh)
-            if (config == null && !refresh) {
-                val retried = fetchConfig(forceNetwork = true)
-                document = retried.first
-                config = retried.second
-            }
-            (config ?: error("XXX Yaoi: configuração da biblioteca não encontrada (${LibraryConfig.diagnose(document)})."))
-                .also { libraryConfig = it }
+    private fun invalidateLibraryConfig(expectedGeneration: Long) {
+        val current = libraryConfigState ?: return
+        if (current.generation == expectedGeneration) {
+            libraryConfigState = null
         }
+    }
+
+    private suspend fun libraryConfig(
+        refresh: Boolean,
+        failedGeneration: Long? = null,
+    ): CachedLibraryConfig = libraryConfigMutex.withLock {
+        val existing = libraryConfigState
+        if (!refresh && existing != null) {
+            return@withLock existing
+        }
+        if (refresh && failedGeneration != null && existing != null && existing.generation > failedGeneration) {
+            // A concurrent request already refreshed the library config after our failure.
+            return@withLock existing
+        }
+
+        suspend fun fetchConfig(forceNetwork: Boolean): Pair<Document, LibraryConfig?> {
+            val document = client.get(
+                "$baseUrl/biblioteca/",
+                Fetch.DOCUMENT,
+                if (forceNetwork) CacheControl.FORCE_NETWORK else DEFAULT_CACHE_CONTROL,
+            ).asJsoup()
+            return document to LibraryConfig.fromDocument(document)
+        }
+
+        var (document, config) = fetchConfig(forceNetwork = refresh)
+        if (config == null && !refresh) {
+            val retried = fetchConfig(forceNetwork = true)
+            document = retried.first
+            config = retried.second
+        }
+        val resolved = config ?: run {
+            val diagnosis = LibraryConfig.diagnose(document)
+            if (diagnosis == "cloudflare-challenge" || diagnosis == "waf-blocked") {
+                throw CloudflareSessionException(
+                    state = sessionManager.state,
+                    diagnosis = diagnosis,
+                    message = "XXX Yaoi: bloqueio Cloudflare ao carregar a biblioteca ($diagnosis). Abra pelo ícone de globo para resolver.",
+                )
+            }
+            error("XXX Yaoi: configuração da biblioteca não encontrada ($diagnosis).")
+        }
+        val nextGeneration = (existing?.generation ?: 0L) + 1L
+        return@withLock CachedLibraryConfig(resolved, nextGeneration).also { libraryConfigState = it }
     }
 
     override val mangaSubString = "bl"
@@ -244,7 +283,7 @@ abstract class XXXYaoi : MadaraNoAjax() {
         val scan = Layout.property(document, "Scan")?.text()
             ?.takeIf { it.isNotBlank() && !it.equals("Não informado", ignoreCase = true) }
         val base = document.location().toHttpUrlOrNull() ?: baseUrl.toHttpUrl()
-        val encodedChapters = document.select("ul.version-chap > li, li.wp-manga-chapter").mapNotNull { rowElement ->
+        val encodedChapters = document.select("ul.version-chap > li, .wp-manga-chapter, [class*=chap-list] > li, [class*=chapter-list] > li, li[data-chap], li[data-xy], div[data-chap]").mapNotNull { rowElement ->
             val link = rowElement.selectFirst("a")
             val row = ChapterRow.fromElement(rowElement)
             val decodedHref = link?.let(ChapterRow::decodedHref)
@@ -346,15 +385,26 @@ abstract class XXXYaoi : MadaraNoAjax() {
 
         suspend fun loadPagesOnce(document: Document): Pair<String, List<String>> {
             val playerUrl = Reader.playerIframeUrl(document)
+            var playerRestriction: Reader.BrowserRestricted? = null
             if (playerUrl != null) {
                 val playerDoc = client.get(playerUrl, Fetch.DOCUMENT.from(chapterUrl), CacheControl.FORCE_NETWORK).asJsoup()
-                val playerPages = Reader.extractPlayerPages(playerDoc).ifEmpty {
-                    runCatching { Reader.load(playerDoc) { scriptUrl -> fetchScriptText(scriptUrl, playerUrl) } }.getOrDefault(emptyList())
+                val playerPages = try {
+                    Reader.extractPlayerPages(playerDoc).ifEmpty {
+                        runCatching { Reader.load(playerDoc) { scriptUrl -> fetchScriptText(scriptUrl, playerUrl) } }.getOrDefault(emptyList())
+                    }
+                } catch (error: Reader.BrowserRestricted) {
+                    playerRestriction = error
+                    emptyList()
                 }
                 if (playerPages.isNotEmpty()) return playerUrl to playerPages
             }
-            val directPages = Reader.load(document, { super.parsePages(document).mapNotNull(Page::imageUrl) }) { scriptUrl ->
-                fetchScriptText(scriptUrl, chapterUrl)
+            val directPages = try {
+                Reader.load(document, { super.parsePages(document).mapNotNull(Page::imageUrl) }) { scriptUrl ->
+                    fetchScriptText(scriptUrl, chapterUrl)
+                }
+            } catch (error: Reader.PagesNotFound) {
+                playerRestriction?.let { throw it }
+                throw error
             }
             return chapterUrl to directPages
         }
@@ -362,8 +412,10 @@ abstract class XXXYaoi : MadaraNoAjax() {
         val firstDoc = loadChapterDocument()
         val (pageReferer, imageUrls) = try {
             loadPagesOnce(firstDoc)
-        } catch (firstError: Reader.PagesNotFound) {
-            if (Reader.playerIframeUrl(firstDoc) != null) {
+        } catch (firstError: Exception) {
+            val shouldRefresh = (firstError is Reader.PagesNotFound || firstError is Reader.BrowserRestricted) &&
+                Reader.playerIframeUrl(firstDoc) != null
+            if (shouldRefresh) {
                 val refreshedDoc = loadChapterDocument()
                 loadPagesOnce(refreshedDoc)
             } else {
@@ -419,10 +471,11 @@ abstract class XXXYaoi : MadaraNoAjax() {
 
     override suspend fun fetchFilterData(): JsonElement {
         val document = client.get("$baseUrl/biblioteca/", Fetch.DOCUMENT).asJsoup()
-        val primary = document.select(".xyaoi-genre-item[data-genre]").mapNotNull { element ->
+        val primary = document.select(".xyaoi-genre-item[data-genre], [data-genre]").mapNotNull { element ->
             val slug = element.attr("data-genre").trim().takeIf(String::isNotEmpty) ?: return@mapNotNull null
-            val label = element.selectFirst("> span:not(.xyaoi-genre-count)")?.text()
-                ?: element.ownText().takeIf(String::isNotEmpty)
+            val label = element.selectFirst("> span:not(.xyaoi-genre-count):not(:matches(^\\(\\d+\\)$))")?.text()?.trim()?.takeIf(String::isNotEmpty)
+                ?: element.children().firstOrNull { !GENRE_COUNT_REGEX.matches(it.text().trim()) }?.text()?.trim()?.takeIf(String::isNotEmpty)
+                ?: element.ownText().trim().takeIf(String::isNotEmpty)
                 ?: return@mapNotNull null
             Genre(label, slug)
         }
@@ -439,6 +492,8 @@ abstract class XXXYaoi : MadaraNoAjax() {
         return genres.distinctBy(Genre::slug).toJsonElement()
     }
 }
+
+private val GENRE_COUNT_REGEX = Regex("""^\(\d+\)$""")
 
 internal class TransientRetryInterceptor(
     private val maxRetries: Int = 2,
@@ -480,9 +535,9 @@ internal class ImageContentInterceptor : Interceptor {
         val expectsImage = request.header("Accept")?.contains("image/", ignoreCase = true) == true
         if (!expectsImage || !response.isSuccessful) return response
         val contentType = response.header("Content-Type")?.lowercase().orEmpty()
-        if (contentType.startsWith("text/html") || contentType.startsWith("application/xhtml")) {
+        if (contentType.startsWith("text/") || contentType.startsWith("application/xhtml") || contentType.startsWith("application/json")) {
             response.close()
-            throw IOException("XXX Yaoi: resposta HTML inesperada ao baixar imagem.")
+            throw IOException("XXX Yaoi: resposta inesperada ($contentType) ao baixar imagem.")
         }
         return response
     }
