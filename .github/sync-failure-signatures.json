@@ -1,13 +1,13 @@
 {
-  "cause": "Build infrastructure validation failed (core): -extensoes/core/src/test/kotlin/keiyoushi/source/MirrorPreferencesTest.kt:63:52 Cannot access 'val mirrors: List<Pair<String, String>>': it is private in 'keiyoushi.source.MirrorPreferences'.\n\nFAILURE: Build failed with an exception.\n\n* What went wrong:\nExecution failed for task ':core:compileDebugUnitTestKotlin' (registered by plugin 'com.android.internal.library').\n> A failure occurred while executing org.jetbrains.kotlin.compilerRunner.btapi.BuildToolsApiCompilationWork\n   > Compilation error. See log for more details\n\n* Try:\n> Run with --stacktrace option to get the stack trace.\n> Run with --info or --debug option to get more log output.\n> Run with --scan to get full insights from a Build Scan (powered by Develocity).\n> Get more help at https://help.gradle.org.\n\nBUILD FAILED in 2m 51s\n",
+  "cause": "Build infrastructure validation failed (core): -extensoes/core/src/test/kotlin/keiyoushi/source/MirrorPreferencesTest.kt:63:52 Cannot access 'val mirrors: List<Pair<String, String>>': it is private in 'keiyoushi.source.MirrorPreferences'.\n\nFAILURE: Build failed with an exception.\n\n* What went wrong:\nExecution failed for task ':core:compileDebugUnitTestKotlin' (registered by plugin 'com.android.internal.library').\n> A failure occurred while executing org.jetbrains.kotlin.compilerRunner.btapi.BuildToolsApiCompilationWork\n   > Compilation error. See log for more details\n\n* Try:\n> Run with --stacktrace option to get the stack trace.\n> Run with --info or --debug option to get more log output.\n> Run with --scan to get full insights from a Build Scan (powered by Develocity).\n> Get more help at https://help.gradle.org.\n\nBUILD FAILED in 2m 44s\n",
   "code_sha": "f1d2fe9f004f9248fb5f5ac0e96cc976782cbaaf",
   "failed_units": [
     "core"
   ],
-  "last_signature": "57729b3f60a882f98cab8224d6c2870f36acdcbc20cc5d3d9f819a1bf6d5252c",
-  "local_head": "1009fe75dcd852c213699335daa2d7ce4b61e81a",
-  "recorded_at": "2026-11-25T03:25:44.860680+00:00",
+  "last_signature": "e08fe4cb944a9509e68e435f9c60837638acf307db17eebd3be6801d927d93ba",
+  "local_head": "64fba5b3acabd7d48c425fbf888085aacaec045b",
+  "recorded_at": "2026-11-25T13:12:56.052898+00:00",
   "skip_count": 0,
   "state": "BLOCKED_STRUCTURAL",
-  "upstream_head": "fdb08c399c722e25af5c0d0105751b69b1bbddc5"
+  "upstream_head": "bac637ac333a03da0f8c5e7894713d782670b2d7"
 }
