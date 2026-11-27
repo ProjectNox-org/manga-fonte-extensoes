@@ -7,7 +7,7 @@ plugins {
 keiyoushi {
     name = "Manhwa18.today"
     theme = "madara"
-    versionCode = 0
+    versionCode = 1
     contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
 

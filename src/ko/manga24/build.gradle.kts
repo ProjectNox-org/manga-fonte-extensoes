@@ -7,7 +7,7 @@ plugins {
 keiyoushi {
     name = "Manga24"
     theme = "madara"
-    versionCode = 0
+    versionCode = 1
     contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
 

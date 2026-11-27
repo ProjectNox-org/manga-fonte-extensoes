@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Gourmet Scans"
-    versionCode = 0
+    versionCode = 1
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
     theme = "madara"

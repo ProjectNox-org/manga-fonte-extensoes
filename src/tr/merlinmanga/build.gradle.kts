@@ -7,7 +7,7 @@ plugins {
 keiyoushi {
     name = "Merlin Manga"
     theme = "madara"
-    versionCode = 0
+    versionCode = 1
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 

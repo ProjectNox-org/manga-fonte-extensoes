@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Pink Sea Unicorn"
-    versionCode = 2
+    versionCode = 3
     contentWarning = ContentWarning.NSFW // or MIXED, please confirm
     libVersion = "1.6"
     theme = "madara"

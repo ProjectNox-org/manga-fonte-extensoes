@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Manhua Plus"
-    versionCode = 8
+    versionCode = 9
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
     theme = "madara"

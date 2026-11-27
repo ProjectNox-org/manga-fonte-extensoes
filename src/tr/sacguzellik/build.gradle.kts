@@ -7,7 +7,7 @@ plugins {
 keiyoushi {
     name = "Saç Güzellik"
     theme = "madara"
-    versionCode = 0
+    versionCode = 1
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
 

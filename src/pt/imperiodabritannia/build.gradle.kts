@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Sagrado Imp\u00e9rio da Britannia"
-    versionCode = 2
+    versionCode = 3
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
     theme = "mangotheme"

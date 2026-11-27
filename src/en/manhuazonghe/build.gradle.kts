@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Manhua Zonghe"
-    versionCode = 1
+    versionCode = 2
     contentWarning = ContentWarning.NSFW // or MIXED, please confirm
     libVersion = "1.6"
     theme = "madara"
