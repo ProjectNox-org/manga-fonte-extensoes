@@ -1017,9 +1017,12 @@ def verify_migration_plan(
                     # so source equality alone is insufficient. Preserve any
                     # local Gradle, asset, or resource customization in the
                     # candidate and prove that reconciliation can build.
-                    preserve = rows_by_unit[unit].get("protected", False) or (
-                        rows_by_unit[unit].get("unit_divergent", False)
-                        and not unit_matches_upstream_history(unit, upstream_ref)
+                    preserve = path_exists("HEAD", unit) and (
+                        rows_by_unit[unit].get("protected", False)
+                        or (
+                            rows_by_unit[unit].get("unit_divergent", False)
+                            and not unit_matches_upstream_history(unit, upstream_ref)
+                        )
                     )
                     if not preserve:
                         result = subprocess.run(
@@ -2231,10 +2234,20 @@ def prove_protected_multisrc(
                     if preserve:
                         if target:
                             apply_structural_metadata_to_path(sandbox / dependent / "build.gradle.kts", *target)
+                            if target[0] and target[0] != theme and path_exists(upstream_ref, f"lib-multisrc/{target[0]}"):
+                                subprocess.run(
+                                    ["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--worktree", "--", f"lib-multisrc/{target[0]}"],
+                                    check=True,
+                                )
                     else:
                         subprocess.run(["git", "-C", str(sandbox), "rm", "-r", "--ignore-unmatch", "--quiet", "--", dependent], check=True)
                         if path_exists(upstream_ref, dependent):
                             subprocess.run(["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--staged", "--worktree", "--", dependent], check=True)
+                            if target and target[0] and target[0] != theme and path_exists(upstream_ref, f"lib-multisrc/{target[0]}"):
+                                subprocess.run(
+                                    ["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--worktree", "--", f"lib-multisrc/{target[0]}"],
+                                    check=True,
+                                )
                 if Path("local.properties").exists():
                     shutil.copy("local.properties", sandbox / "local.properties")
                 active_dependents = [
@@ -2600,7 +2613,7 @@ def _apply_units(
             # unit. Otherwise retain all local files and merge selectors; the
             # build validation below is the proof that this reconciliation is
             # compatible before the transaction can be committed.
-            preserve_local_unit = unit_divergent and not unit_matches_upstream_history(unit, upstream_ref)
+            preserve_local_unit = path_exists("HEAD", unit) and unit_divergent and not unit_matches_upstream_history(unit, upstream_ref)
             if preserve_local_unit:
                 print(f"Preserving local files outside upstream history: {unit}")
                 changed = merge_structural_metadata(unit, upstream_ref)

@@ -2834,6 +2834,90 @@ class SyncRecoveryRegressionTest(unittest.TestCase):
         self.assertIn("mirrors: Array<Pair<String, String>> = defaultMirrors", mirror_text)
         self.assertIn("Backwards compatibility for Nox extensions", okhttp_text)
 
+    def test_verify_migration_plan_restores_new_upstream_unit_absent_on_head(self):
+        self._write("gradlew", "#!/bin/sh\nexit 0\n")
+        Path(self.repo / "gradlew").chmod(0o755)
+        self.git("add", ".")
+        self.git("commit", "-m", "base")
+
+        self.git("checkout", "-b", "upstream-catharsis")
+        self._write(
+            "lib-multisrc/catharsis/build.gradle.kts",
+            'ext {\n    isNsfw = false\n}\next {\n    set("libVersion", "1.6")\n}\nbaseVersionCode = 2\n',
+        )
+        self._write(
+            "src/es/aedex/build.gradle.kts",
+            'ext {\n    extName = "Aedex"\n    theme = "catharsis"\n    libVersion = "1.6"\n    versionCode = 1\n}\n',
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "upstream add catharsis and aedex")
+        up_sha = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "main")
+        self.git("merge", "--no-ff", "-s", "ours", "-m", "deferred ours", up_sha)
+        sync_upstream.write_deferred_migrations({"catharsis": {"upstream_ref": up_sha, "units": ["src/es/aedex"]}})
+        self.git("add", ".")
+        self.git("commit", "-m", "record deferred catharsis")
+
+        report = {
+            "catharsis": [{
+                "unit": "src/es/aedex",
+                "protected": False,
+                "local_libVersion": None,
+                "upstream_libVersion": "1.6",
+                "multisrc_libVersion": "1.6",
+                "libVersion_downgrade": False,
+                "source_divergent": True,
+                "unit_divergent": True,
+                "migration_required": True,
+                "migration_supported": True,
+            }],
+        }
+        res = sync_upstream.verify_migration_plan(report, up_sha)
+        self.assertEqual(res.blocked, set())
+        self.assertIn("catharsis", res.proven)
+
+    def test_prove_protected_multisrc_allows_unprotected_dependent_switching_to_new_theme(self):
+        self._write("gradlew", "#!/bin/sh\nexit 0\n")
+        Path(self.repo / "gradlew").chmod(0o755)
+        self._write(
+            "lib-multisrc/madara/build.gradle.kts",
+            'val libVersion = "1.6"\nval baseVersionCode = 1\n',
+        )
+        self._write("lib-multisrc/madara/src/Madara.kt", "// base\n")
+        self._write(
+            "src/id/kaguya/build.gradle.kts",
+            'ext {\n    extName = "Kaguya"\n    theme = "madara"\n    libVersion = "1.6"\n    versionCode = 1\n}\n',
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "base")
+        base_sha = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "-b", "upstream-madara")
+        self._write(
+            "lib-multisrc/madara/build.gradle.kts",
+            'val libVersion = "1.6"\nval baseVersionCode = 2\n',
+        )
+        self._write(
+            "lib-multisrc/aesir/build.gradle.kts",
+            'val libVersion = "1.6"\nval baseVersionCode = 1\n',
+        )
+        self._write(
+            "src/id/kaguya/build.gradle.kts",
+            'ext {\n    extName = "Kaguya"\n    theme = "aesir"\n    libVersion = "1.6"\n    versionCode = 2\n}\n',
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "upstream move kaguya to aesir")
+
+        self.git("checkout", "main")
+        self._write("lib-multisrc/madara/src/Madara.kt", "// base\n// nox tweak\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "nox madara customization")
+
+        accepted, deferred = sync_upstream.prove_protected_multisrc(base_sha, "upstream-madara", [], set())
+        self.assertIn("madara", accepted)
+        self.assertNotIn("madara", deferred)
+
 
 if __name__ == "__main__":
     unittest.main()
