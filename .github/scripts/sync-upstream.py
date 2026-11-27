@@ -2225,20 +2225,25 @@ def prove_protected_multisrc(
                     if path_exists(upstream_ref, normal):
                         subprocess.run(["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--staged", "--worktree", "--", normal], check=True)
                 merge_multisrc(sandbox, theme, patch_base, upstream_ref)
+                build_dependents = []
                 for dependent in dependents:
+                    local_meta = structural_metadata(None, dependent)
                     target = structural_metadata(upstream_ref, dependent)
                     exists_in_sandbox = (sandbox / dependent / "build.gradle.kts").exists()
                     preserve = exists_in_sandbox and (
                         dependent in protected_units or dependent in local_changed or target is None
                     )
                     if preserve:
-                        if target:
+                        # If a protected/localized extension moved to another multisrc theme locally
+                        # (e.g., madara -> zeistmanga), never coerce its theme selector back to `theme`.
+                        if local_meta and local_meta[0] != theme:
+                            continue
+                        if target and target[0] == theme:
                             apply_structural_metadata_to_path(sandbox / dependent / "build.gradle.kts", *target)
-                            if target[0] and target[0] != theme and path_exists(upstream_ref, f"lib-multisrc/{target[0]}"):
-                                subprocess.run(
-                                    ["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--worktree", "--", f"lib-multisrc/{target[0]}"],
-                                    check=True,
-                                )
+                        elif target and not (local_meta and local_meta[0] == theme):
+                            apply_structural_metadata_to_path(sandbox / dependent / "build.gradle.kts", *target)
+                        if (sandbox / dependent / "build.gradle.kts").exists():
+                            build_dependents.append(dependent)
                     else:
                         subprocess.run(["git", "-C", str(sandbox), "rm", "-r", "--ignore-unmatch", "--quiet", "--", dependent], check=True)
                         if path_exists(upstream_ref, dependent):
@@ -2248,6 +2253,8 @@ def prove_protected_multisrc(
                                     ["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--worktree", "--", f"lib-multisrc/{target[0]}"],
                                     check=True,
                                 )
+                            elif (sandbox / dependent / "build.gradle.kts").exists():
+                                build_dependents.append(dependent)
                 if Path("local.properties").exists():
                     shutil.copy("local.properties", sandbox / "local.properties")
                 active_dependents = [
@@ -2265,7 +2272,7 @@ def prove_protected_multisrc(
                 paths = [unit, *active_dependents]
                 subprocess.run(["git", "-C", str(sandbox), "add", "-A", "--", *paths], check=True)
                 tree = subprocess.run(["git", "-C", str(sandbox), "write-tree"], capture_output=True, text=True, check=True).stdout.strip()
-                tasks = [f":{dependent.replace('/', ':')}:assembleDebug" for dependent in active_dependents]
+                tasks = [f":{dependent.replace('/', ':')}:assembleDebug" for dependent in build_dependents]
                 tasks.append(f":lib-multisrc:{theme}:testDebugUnitTest")
                 proof = subprocess.run([str(sandbox / "gradlew"), *tasks], cwd=sandbox)
                 if proof.returncode:
@@ -2724,14 +2731,15 @@ def _apply_units(
             # and the preserved Nox source. Apply it before the generic version
             # guard, which must not block an atomic structural migration.
             git("rm", "-r", "--ignore-unmatch", "--quiet", "--", unit)
-            git("restore", f"--source={candidate['tree']}", "--staged", "--worktree", "--", unit)
-            if unit.startswith("src/"):
-                validation_units.add(unit)
-            if unit in previous_versions and bump_after_structural_change(unit, previous_versions[unit]):
-                git("add", "--", f"{unit}/build.gradle.kts")
-                current_info = effective_version_code(None, unit)
-                if current_info:
-                    bumped.append(f"{unit} -> versionCode={current_info.raw}")
+            if path_exists(candidate["tree"], unit):
+                git("restore", f"--source={candidate['tree']}", "--staged", "--worktree", "--", unit)
+                if unit.startswith("src/"):
+                    validation_units.add(unit)
+                if unit in previous_versions and bump_after_structural_change(unit, previous_versions[unit]):
+                    git("add", "--", f"{unit}/build.gradle.kts")
+                    current_info = effective_version_code(None, unit)
+                    if current_info:
+                        bumped.append(f"{unit} -> versionCode={current_info.raw}")
 
     # Deferred themes may no longer appear in base..upstream after an ours merge.
     # Their protected extensions must still receive their proven selector migration.

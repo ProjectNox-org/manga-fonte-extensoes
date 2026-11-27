@@ -2918,6 +2918,53 @@ class SyncRecoveryRegressionTest(unittest.TestCase):
         self.assertIn("madara", accepted)
         self.assertNotIn("madara", deferred)
 
+    def test_prove_protected_multisrc_preserves_protected_unit_on_different_local_theme(self):
+        self._write("gradlew", "#!/bin/sh\nexit 0\n")
+        Path(self.repo / "gradlew").chmod(0o755)
+        self._write(
+            "lib-multisrc/madara/build.gradle.kts",
+            'val libVersion = "1.6"\nval baseVersionCode = 1\n',
+        )
+        self._write("lib-multisrc/madara/src/Madara.kt", "// base\n")
+        self._write(
+            "lib-multisrc/zeistmanga/build.gradle.kts",
+            'val libVersion = "1.6"\nval baseVersionCode = 1\n',
+        )
+        self._write(
+            "src/pt/yaoifanclub/build.gradle.kts",
+            'ext {\n    extName = "YaoiFanClub"\n    theme = "madara"\n    libVersion = "1.6"\n    versionCode = 1\n}\n',
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "base")
+        base_sha = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "-b", "upstream-madara2")
+        self._write(
+            "lib-multisrc/madara/build.gradle.kts",
+            'val libVersion = "1.6"\nval baseVersionCode = 2\n',
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "upstream bump madara")
+
+        self.git("checkout", "main")
+        self._write(".github/nox-protected.txt", "src/pt/yaoifanclub\n")
+        self._write("lib-multisrc/madara/src/Madara.kt", "// base\n// nox tweak\n")
+        self._write(
+            "src/pt/yaoifanclub/build.gradle.kts",
+            'ext {\n    extName = "YaoiFanClub"\n    theme = "zeistmanga"\n    libVersion = "1.6"\n    versionCode = 2\n}\n',
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "nox migrated yaoifanclub to zeistmanga")
+
+        accepted, deferred = sync_upstream.prove_protected_multisrc(base_sha, "upstream-madara2", ["src/pt/yaoifanclub"], set())
+        self.assertIn("madara", accepted)
+        self.assertNotIn("madara", deferred)
+        gradle_in_tree = subprocess.check_output(
+            ["git", "show", f"{accepted['madara']['tree']}:src/pt/yaoifanclub/build.gradle.kts"],
+            text=True,
+        )
+        self.assertIn('theme = "zeistmanga"', gradle_in_tree)
+
 
 if __name__ == "__main__":
     unittest.main()
