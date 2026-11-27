@@ -20,22 +20,9 @@
       ],
       "upstream_ref": "7f91c9da5944b7b334758f3c437797fe31fc616c"
     },
-    "catharsis": {
-      "units": [
-        "src/es/aedex"
-      ],
-      "upstream_ref": "upstream/main"
-    },
-    "dm5": {
-      "units": [
-        "src/zh/dm5",
-        "src/zh/jisumanhua"
-      ],
-      "upstream_ref": "upstream/main"
-    },
     "madara": {
       "patch_base": "f1bd88dacd89dfe644369c397efedf79965bf4c0",
-      "reason": "incompatible dependent selector: src/id/kaguya",
+      "reason": "proof build/tests failed",
       "units": [
         "src/all/allporncomicsco",
         "src/all/comicsvalley",
