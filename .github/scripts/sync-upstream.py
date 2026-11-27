@@ -2227,6 +2227,7 @@ def prove_protected_multisrc(
                         subprocess.run(["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--staged", "--worktree", "--", normal], check=True)
                 merge_multisrc(sandbox, theme, patch_base, upstream_ref)
                 build_dependents = []
+                owned_dependents = []
                 for dependent in dependents:
                     local_meta = structural_metadata(None, dependent)
                     target = structural_metadata(upstream_ref, dependent)
@@ -2245,6 +2246,7 @@ def prove_protected_multisrc(
                             apply_structural_metadata_to_path(sandbox / dependent / "build.gradle.kts", *target)
                         elif target and not (local_meta and local_meta[0] == theme):
                             apply_structural_metadata_to_path(sandbox / dependent / "build.gradle.kts", *target)
+                        owned_dependents.append(dependent)
                         if (sandbox / dependent / "build.gradle.kts").exists():
                             build_dependents.append(dependent)
                     else:
@@ -2256,12 +2258,17 @@ def prove_protected_multisrc(
                                     ["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--worktree", "--", f"lib-multisrc/{target[0]}"],
                                     check=True,
                                 )
-                            elif (sandbox / dependent / "build.gradle.kts").exists():
-                                build_dependents.append(dependent)
+                            else:
+                                owned_dependents.append(dependent)
+                                if (sandbox / dependent / "build.gradle.kts").exists():
+                                    build_dependents.append(dependent)
+                        else:
+                            # Unprotected unit removed upstream must still be pruned by this theme migration.
+                            owned_dependents.append(dependent)
                 if Path("local.properties").exists():
                     shutil.copy("local.properties", sandbox / "local.properties")
                 active_dependents = [
-                    dependent for dependent in dependents
+                    dependent for dependent in owned_dependents
                     if (sandbox / dependent / "build.gradle.kts").exists()
                 ]
                 for dependent in active_dependents:
@@ -2283,8 +2290,8 @@ def prove_protected_multisrc(
                     raise ValueError("proof build/tests failed")
                 if subprocess.run(["git", "-C", str(sandbox), "diff", "--quiet", tree, "--", *paths]).returncode:
                     raise ValueError("build changed candidate sources")
-                accepted[theme] = {"tree": tree, "units": dependents}
-                print(f"Protected Nox multisrc proven: {theme} ({len(dependents)} dependents)")
+                accepted[theme] = {"tree": tree, "units": owned_dependents, "all_units": dependents}
+                print(f"Protected Nox multisrc proven: {theme} ({len(owned_dependents)} dependents)")
             except (ValueError, OSError, subprocess.CalledProcessError) as error:
                 deferred[theme] = dict(entry, reason=str(error))
                 print(f"Protected Nox multisrc deferred: {theme}: {error}")
@@ -2299,7 +2306,10 @@ def propagate_multisrc_deferrals(proven, deferred, blocked, bases, upstream_ref)
     base_commit = git("merge-base", "HEAD", upstream_ref).strip()
     while True:
         blocked_units = {unit for theme in blocked for unit in local.get(theme, []) + upstream.get(theme, [])}
-        affected = [theme for theme, candidate in proven.items() if blocked_units.intersection(candidate["units"])]
+        affected = [
+            theme for theme, candidate in proven.items()
+            if blocked_units.intersection(candidate.get("all_units", candidate["units"]))
+        ]
         if not affected:
             return
         for theme in affected:
@@ -2308,7 +2318,7 @@ def propagate_multisrc_deferrals(proven, deferred, blocked, bases, upstream_ref)
             deferred[theme] = {
                 "patch_base": bases.get(theme, base_commit),
                 "upstream_ref": git("rev-parse", upstream_ref).strip(),
-                "units": candidate["units"],
+                "units": candidate.get("all_units", candidate["units"]),
                 "reason": "dependent shared with deferred theme",
             }
 
@@ -2518,6 +2528,7 @@ def apply_units(
     exception so a failed structural migration cannot leave an index or
     working tree half-applied.
     """
+    start_head = git("rev-parse", "HEAD").strip()
     try:
         return _apply_units(
             upstream_ref,
@@ -2532,6 +2543,9 @@ def apply_units(
     except BaseException:
         if merge_in_progress():
             git("merge", "--abort", check=False)
+        if git("rev-parse", "HEAD").strip() == start_head:
+            git("reset", "--hard", "HEAD", check=False)
+            git("clean", "-fdq", check=False)
         raise
 
 
@@ -2729,12 +2743,16 @@ def _apply_units(
                     git("add", "--", f"{unit}/build.gradle.kts")
 
     bumped = []
+    seen_proven: set[str] = set()
     for theme, candidate in proven_multisrc.items():
         for unit in [f"lib-multisrc/{theme}", *candidate["units"]]:
+            if unit in seen_proven:
+                continue
+            seen_proven.add(unit)
             # This tree was built successfully with the upstream multisrc metadata
             # and the preserved Nox source. Apply it before the generic version
             # guard, which must not block an atomic structural migration.
-            git("rm", "-r", "--ignore-unmatch", "--quiet", "--", unit)
+            git("rm", "-r", "-f", "--ignore-unmatch", "--quiet", "--", unit)
             if path_exists(candidate["tree"], unit):
                 git("restore", f"--source={candidate['tree']}", "--staged", "--worktree", "--", unit)
                 if unit.startswith("src/"):
