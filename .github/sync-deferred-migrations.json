@@ -10,15 +10,6 @@
         "src/pt/mugiwarasoficial"
       ],
       "upstream_ref": "9f70fabf1105390dca5d5b3ae52d1cd8113afa7d"
-    },
-    "mmlook": {
-      "patch_base": "293eb3cdbf4ca73ff238ab54cec3f095a3bdbdc2",
-      "reason": "functional conflict: lib-multisrc/mmlook/src/eu/kanade/tachiyomi/multisrc/mmlook/MMLook.kt",
-      "units": [
-        "src/zh/dumanwu",
-        "src/zh/rumanhua"
-      ],
-      "upstream_ref": "9f70fabf1105390dca5d5b3ae52d1cd8113afa7d"
     }
   }
 }
