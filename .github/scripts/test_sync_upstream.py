@@ -2093,14 +2093,16 @@ class BuildMatrixTest(unittest.TestCase):
 
     def test_e_aurora_builds_exactly_four_dependents(self):
         names = {"mangasbrasuka", "mugiwarasoficial", "leitordemangas", "manganyx"}
-        self.assertEqual(self.selected("lib-multisrc/aurora/build.gradle.kts"), (
-            {f":src:pt:{name}" for name in names}, {f"pt.{name}" for name in names},
-        ))
+        with patch.object(self.matrix, "load_deferred_locked_units", return_value=set()):
+            self.assertEqual(self.selected("lib-multisrc/aurora/build.gradle.kts"), (
+                {f":src:pt:{name}" for name in names}, {f"pt.{name}" for name in names},
+            ))
 
     def test_f_single_extension_stays_isolated(self):
-        self.assertEqual(self.selected("src/pt/mangasbrasuka/build.gradle.kts"), (
-            {":src:pt:mangasbrasuka"}, {"pt.mangasbrasuka"},
-        ))
+        with patch.object(self.matrix, "load_deferred_locked_units", return_value=set()):
+            self.assertEqual(self.selected("src/pt/mangasbrasuka/build.gradle.kts"), (
+                {":src:pt:mangasbrasuka"}, {"pt.mangasbrasuka"},
+            ))
 
 
 class UpstreamBatchAndObservabilityTest(unittest.TestCase):

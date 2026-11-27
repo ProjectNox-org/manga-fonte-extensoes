@@ -245,6 +245,63 @@ class GenerateBuildMatricesTest(unittest.TestCase):
             self.assertIn(":src:pt:xxxyaoi", modules)
             self.assertIn("pt.xxxyaoi", deleted)
 
+    def test_deferred_aurora_excluded_across_multisrc_removal_and_force_all(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".github").mkdir(parents=True)
+            (root / ".github/sync-deferred-migrations.json").write_text(
+                json.dumps({
+                    "themes": {
+                        "aurora": {
+                            "reason": "functional conflict: Aurora.kt",
+                            "units": [
+                                "src/pt/leitordemangas",
+                                "src/pt/manganyx",
+                                "src/pt/mangasbrasuka",
+                                "src/pt/mugiwarasoficial",
+                            ],
+                        }
+                    }
+                })
+            )
+            (root / "lib-multisrc/aurora").mkdir(parents=True)
+            (root / "lib-multisrc/aurora/build.gradle.kts").write_text("")
+            for u in (
+                "src/pt/leitordemangas",
+                "src/pt/manganyx",
+                "src/pt/mangasbrasuka",
+                "src/pt/mugiwarasoficial",
+                "src/pt/xxxyaoi",
+            ):
+                (root / u).mkdir(parents=True)
+                (root / u / "build.gradle.kts").write_text('theme = "aurora"\n' if "xxx" not in u else "")
+
+            orig_cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                for fake_diff in (
+                    "M\tlib-multisrc/aurora/src/Aurora.kt\nM\tsrc/pt/xxxyaoi/XXXYaoi.kt\n",
+                    "D\tsrc/pt/mugiwarasoficial/MugiwarasOficial.kt\nM\tsrc/pt/xxxyaoi/XXXYaoi.kt\n",
+                ):
+                    with patch.object(gbm, "run_command", return_value=fake_diff):
+                        modules, deleted = get_module_list("a..b")
+                    for ext in ("leitordemangas", "manganyx", "mangasbrasuka", "mugiwarasoficial"):
+                        self.assertNotIn(f":src:pt:{ext}", modules)
+                        self.assertNotIn(f"pt.{ext}", deleted)
+                    self.assertIn(":src:pt:xxxyaoi", modules)
+                    self.assertIn("pt.xxxyaoi", deleted)
+
+                with tempfile.NamedTemporaryFile("w+") as out:
+                    with patch.dict(os.environ, {"FORCE_ALL": "true", "GITHUB_OUTPUT": out.name, "CI": "true"}), \
+                         patch("sys.argv", ["generate-build-matrices.py", "a..b", "Release"]):
+                        gbm.main()
+                    out_text = Path(out.name).read_text()
+                    for ext in ("leitordemangas", "manganyx", "mangasbrasuka", "mugiwarasoficial"):
+                        self.assertNotIn(ext, out_text)
+                    self.assertIn(":src:pt:xxxyaoi:assembleRelease", out_text)
+            finally:
+                os.chdir(orig_cwd)
+
 
 if __name__ == "__main__":
     unittest.main()

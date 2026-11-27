@@ -76,6 +76,29 @@ def resolve_module_to_packages(module: str, remote_exts: dict[str, index_pb2.Ext
 
 
 
+def load_locked_deferred_packages(remote_exts: dict[str, index_pb2.Extension]) -> set[str]:
+    """Resolve packages locked by deferred migrations so publish never removes or replaces them."""
+    deferred_file = SOURCE_DIR / ".github" / "sync-deferred-migrations.json"
+    if not deferred_file.is_file():
+        return set()
+    try:
+        data = json.loads(deferred_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    themes = data.get("themes", {})
+    if not isinstance(themes, dict):
+        return set()
+    locked: set[str] = set()
+    for entry in themes.values():
+        if not isinstance(entry, dict):
+            continue
+        for unit in entry.get("units", []):
+            if isinstance(unit, str) and unit.startswith("src/"):
+                mod = unit.removeprefix("src/").replace("/", ".")
+                locked.update(resolve_module_to_packages(mod, remote_exts))
+    return locked
+
+
 def validate_catalog_integrity(final_extensions: list[index_pb2.Extension]) -> None:
     """Fail-closed validation: verify uniqueness, non-empty package names, and non-empty icon URLs."""
     all_pkgs = [e.packageName for e in final_extensions]
@@ -188,10 +211,15 @@ def main():
                     canonical_remote[pkg] = ext
 
     remote_extensions = canonical_remote
+    locked_packages = load_locked_deferred_packages(canonical_remote)
 
     deleted_packages: set[str] = set()
     for mod in to_delete:
         deleted_packages.update(resolve_module_to_packages(mod, canonical_remote))
+
+    for locked_pkg in sorted(deleted_packages & locked_packages):
+        print(f"LOCKED_DEFERRED_DELETE_BLOCKED={locked_pkg}")
+    deleted_packages -= locked_packages
 
     release_assets_path = REPO_DIR / "release-assets.json"
     if release_assets_path.exists():
@@ -217,6 +245,9 @@ def main():
             info = json.load(f)
 
         package_name = info["packageName"]
+        if package_name in locked_packages:
+            print(f"LOCKED_DEFERRED_PUBLISH_BLOCKED={package_name}")
+            continue
         if package_name in new_by_package:
             print(f"DUPLICATE_PACKAGE_NAME={package_name}")
             raise ValueError(f"DUPLICATE_PACKAGE_NAME={package_name}: duplicate artifact package in build")
