@@ -302,6 +302,38 @@ class GenerateBuildMatricesTest(unittest.TestCase):
             finally:
                 os.chdir(orig_cwd)
 
+    def test_preserved_orphans_excluded_from_deleted_without_blocking_normal_deletes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".github").mkdir(parents=True)
+            (root / ".github/catalog-preserved-orphans.json").write_text(
+                json.dumps({
+                    "status": "PENDING_FUTURE_CLEANUP",
+                    "units": ["ar.orcamanga", "th.makimaaaaa"],
+                })
+            )
+            (root / "src/pt/xxxyaoi").mkdir(parents=True)
+            (root / "src/pt/xxxyaoi/build.gradle.kts").write_text("")
+
+            orig_cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                diff = (
+                    "D\tsrc/ar/orcamanga/build.gradle.kts\n"
+                    "D\tsrc/th/makimaaaaa/build.gradle.kts\n"
+                    "D\tsrc/en/normaldead/build.gradle.kts\n"
+                    "M\tsrc/pt/xxxyaoi/XXXYaoi.kt\n"
+                )
+                with patch.object(gbm, "run_command", return_value=diff):
+                    modules, deleted = get_module_list("a..b")
+            finally:
+                os.chdir(orig_cwd)
+
+            self.assertNotIn("ar.orcamanga", deleted)
+            self.assertNotIn("th.makimaaaaa", deleted)
+            self.assertIn("en.normaldead", deleted)
+            self.assertEqual(modules, [":src:pt:xxxyaoi"])
+
 
 if __name__ == "__main__":
     unittest.main()

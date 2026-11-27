@@ -3100,6 +3100,8 @@ def main() -> None:
         print("Skipping redundant full build to avoid CI failure loops.")
         print("==================================================")
         print_observability_footer(recorded_state, "SKIPPED", "SKIPPED")
+        if not args.dry_run and (args.push or args.apply_no_push) and str(recorded_state).startswith("BLOCKED"):
+            sys.exit(1)
         return
 
     base = git("merge-base", "HEAD", upstream_ref).strip()

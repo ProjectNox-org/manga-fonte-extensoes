@@ -2765,6 +2765,57 @@ class SyncRecoveryRegressionTest(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "HEAD"), head_before)
         self.assertEqual(sync_upstream.load_failure_signatures()["skip_count"], 1)
 
+    def test_deduplicated_blocked_structural_exits_nonzero_under_push(self):
+        self._write("core/src/main/kotlin/keiyoushi/source/MirrorPreferences.kt", "private val mirrors = emptyList<Any>()\n")
+        self._write("src/en/foo/Foo.kt", "package foo\n// v1\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "initial")
+        u1 = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "-b", "upstream-sim")
+        self._write("src/en/foo/Foo.kt", "package foo\n// v2\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "unrelated upstream extension edit")
+        u2 = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "main")
+        self.git("update-ref", "refs/remotes/origin/main", self.git("rev-parse", "HEAD"))
+        self.git("update-ref", "refs/remotes/upstream/main", u2)
+
+        code_sha = sync_upstream.get_code_sha("HEAD")
+        cause = "MirrorPreferencesTest.kt:63:52 private mirrors"
+        err_sig = sync_upstream.compute_error_signature(code_sha, "BLOCKED_STRUCTURAL", ["core"], cause)
+        sync_upstream.write_failure_signatures({
+            "error_signature": err_sig,
+            "local_head": self.git("rev-parse", "HEAD"),
+            "code_sha": code_sha,
+            "upstream_head": u1,
+            "state": "BLOCKED_STRUCTURAL",
+            "failed_units": ["core"],
+            "cause": cause,
+            "skip_count": 0,
+        })
+        self.git("add", ".github/sync-failure-signatures.json")
+        self.git("commit", "-m", "record block")
+        self.git("update-ref", "refs/remotes/origin/main", self.git("rev-parse", "HEAD"))
+        commits_before = int(self.git("rev-list", "--count", "HEAD"))
+        orig_git = sync_upstream.git
+
+        def fake_git(*args, **kw):
+            if args[:1] == ("fetch",):
+                return ""
+            return orig_git(*args, **kw)
+
+        with patch("sys.argv", ["sync-upstream.py", "--push"]), \
+             patch.object(sync_upstream, "ensure_clean_tree"), \
+             patch.object(sync_upstream, "ensure_upstream_remote"), \
+             patch.object(sync_upstream, "git", side_effect=fake_git):
+            with self.assertRaises(SystemExit) as cm:
+                sync_upstream.main()
+            self.assertEqual(cm.exception.code, 1)
+
+        self.assertEqual(int(self.git("rev-list", "--count", "HEAD")), commits_before)
+
     def test_same_error_signature_does_not_create_duplicate_skip_ci_commit(self):
         self._write("core/Dummy.kt", "class Dummy\n")
         self.git("add", ".")

@@ -978,9 +978,12 @@ class PublisherTest(unittest.TestCase):
         aurora_ext.name = "Mugiwaras Oficial"
         brasuka_ext = extension("mangasbrasuka", 12)
         brasuka_ext.name = "Mangás Brasuka"
+        orphan_ext = extension("orcamanga", 20)
+        orphan_ext.packageName = "eu.kanade.tachiyomi.extension.ar.orcamanga"
+        orphan_ext.name = "OrcaManga"
         other_ext = extension("geasscomics", 5)
-        modern = index_pb2.Index(extensionList=index_pb2.ExtensionList(extensions=[aurora_ext, brasuka_ext, other_ext]))
-        old = [legacy(aurora_ext), legacy(brasuka_ext), legacy(other_ext)]
+        modern = index_pb2.Index(extensionList=index_pb2.ExtensionList(extensions=[aurora_ext, brasuka_ext, orphan_ext, other_ext]))
+        old = [legacy(aurora_ext), legacy(brasuka_ext), legacy(orphan_ext), legacy(other_ext)]
 
         # Attempt BOTH deleting all 4 locked Aurora units AND publishing a stray rebuilt APK alongside geasscomics
         aurora_stray = extension("mugiwarasoficial", 99)
@@ -1010,7 +1013,7 @@ class PublisherTest(unittest.TestCase):
             try:
                 os.chdir(root)
                 stdout = io.StringIO()
-                delete_arg = json.dumps(["pt.mugiwarasoficial", "pt.mangasbrasuka", "pt.leitordemangas", "pt.manganyx"])
+                delete_arg = json.dumps(["pt.mugiwarasoficial", "pt.mangasbrasuka", "pt.leitordemangas", "pt.manganyx", "ar.orcamanga"])
                 with patch.object(Path, "home", return_value=root), \
                      patch.object(github_utils, "run_gh", return_value='{"assets":[]}'), \
                      patch("sys.argv", [str(SCRIPT), delete_arg, "abc1234"]), \
@@ -1025,12 +1028,14 @@ class PublisherTest(unittest.TestCase):
             output = stdout.getvalue()
             self.assertIn("LOCKED_DEFERRED_DELETE_BLOCKED=eu.kanade.tachiyomi.extension.pt.mugiwarasoficial", output)
             self.assertIn("LOCKED_DEFERRED_DELETE_BLOCKED=eu.kanade.tachiyomi.extension.pt.mangasbrasuka", output)
+            self.assertIn("PRESERVED_ORPHAN_DELETE_BLOCKED=eu.kanade.tachiyomi.extension.ar.orcamanga", output)
             self.assertIn("LOCKED_DEFERRED_PUBLISH_BLOCKED=eu.kanade.tachiyomi.extension.pt.mugiwarasoficial", output)
 
             cur = json_format.Parse((root / "index.json").read_text(), index_pb2.Index())
             by_pkg = {e.packageName: e for e in cur.extensionList.extensions}
             self.assertIn(aurora_ext.packageName, by_pkg)
             self.assertIn(brasuka_ext.packageName, by_pkg)
+            self.assertIn(orphan_ext.packageName, by_pkg)
             self.assertEqual(by_pkg[aurora_ext.packageName].versionCode, 106067)
             self.assertEqual(by_pkg[aurora_ext.packageName].versionName, "1.6.67")
             self.assertEqual(by_pkg[brasuka_ext.packageName].versionCode, 106012)

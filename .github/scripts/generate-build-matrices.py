@@ -37,12 +37,30 @@ def load_deferred_locked_units() -> set[str]:
     return locked
 
 
+def load_preserved_orphan_units() -> set[str]:
+    """Return module selectors (e.g. 'ar.orcamanga') preserved in catalog pending future cleanup."""
+    orphans_file = Path(".github/catalog-preserved-orphans.json")
+    if not orphans_file.is_file():
+        return set()
+    try:
+        data = json.loads(orphans_file.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    units = data.get("units", [])
+    if not isinstance(units, list):
+        return set()
+    return {
+        str(u).removeprefix("src/").replace("/", ".")
+        for u in units
+        if isinstance(u, str) and u.strip()
+    }
+
+
 def _filter_locked_units(modules: set[str] | list[str], deleted: set[str] | list[str]) -> tuple[list[str], list[str]]:
     locked = load_deferred_locked_units()
-    if not locked:
-        return list(modules), list(deleted)
+    preserved_orphans = load_preserved_orphan_units()
     locked_gradle = {f":{u.replace('/', ':')}" for u in locked}
-    locked_pkgs = {u.removeprefix("src/").replace("/", ".") for u in locked}
+    locked_pkgs = {u.removeprefix("src/").replace("/", ".") for u in locked} | preserved_orphans
     return (
         [m for m in modules if m not in locked_gradle],
         [d for d in deleted if d not in locked_pkgs],

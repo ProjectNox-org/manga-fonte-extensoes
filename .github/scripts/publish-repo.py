@@ -99,6 +99,26 @@ def load_locked_deferred_packages(remote_exts: dict[str, index_pb2.Extension]) -
     return locked
 
 
+def load_preserved_orphan_packages(remote_exts: dict[str, index_pb2.Extension]) -> set[str]:
+    """Resolve catalog-preserved orphan packages that must not be auto-deleted during recovery."""
+    orphans_file = SOURCE_DIR / ".github" / "catalog-preserved-orphans.json"
+    if not orphans_file.is_file():
+        return set()
+    try:
+        data = json.loads(orphans_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    units = data.get("units", [])
+    if not isinstance(units, list):
+        return set()
+    preserved: set[str] = set()
+    for unit in units:
+        if isinstance(unit, str) and unit.strip():
+            mod = unit.removeprefix("src/").replace("/", ".")
+            preserved.update(resolve_module_to_packages(mod, remote_exts))
+    return preserved
+
+
 def validate_catalog_integrity(final_extensions: list[index_pb2.Extension]) -> None:
     """Fail-closed validation: verify uniqueness, non-empty package names, and non-empty icon URLs."""
     all_pkgs = [e.packageName for e in final_extensions]
@@ -212,6 +232,7 @@ def main():
 
     remote_extensions = canonical_remote
     locked_packages = load_locked_deferred_packages(canonical_remote)
+    preserved_orphan_packages = load_preserved_orphan_packages(canonical_remote)
 
     deleted_packages: set[str] = set()
     for mod in to_delete:
@@ -219,7 +240,9 @@ def main():
 
     for locked_pkg in sorted(deleted_packages & locked_packages):
         print(f"LOCKED_DEFERRED_DELETE_BLOCKED={locked_pkg}")
-    deleted_packages -= locked_packages
+    for orphan_pkg in sorted(deleted_packages & preserved_orphan_packages):
+        print(f"PRESERVED_ORPHAN_DELETE_BLOCKED={orphan_pkg}")
+    deleted_packages -= (locked_packages | preserved_orphan_packages)
 
     release_assets_path = REPO_DIR / "release-assets.json"
     if release_assets_path.exists():

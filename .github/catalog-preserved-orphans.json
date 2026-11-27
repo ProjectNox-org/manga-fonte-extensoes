@@ -1,0 +1,13 @@
+{
+  "status": "PENDING_FUTURE_CLEANUP",
+  "reason": "Removed upstream in Keiyoushi (#21397, #21485) while still present in published catalog; preserved during recovery until explicit cleanup approval.",
+  "units": [
+    "ar.orcamanga",
+    "fr.sushiscanfr",
+    "fr.yaoiscan",
+    "id.lianscans",
+    "id.manhwalistorg",
+    "id.tooncubus",
+    "th.makimaaaaa"
+  ]
+}
