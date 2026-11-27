@@ -22,7 +22,7 @@
     },
     "madara": {
       "patch_base": "f1bd88dacd89dfe644369c397efedf79965bf4c0",
-      "reason": "proof build/tests failed",
+      "reason": "build changed candidate sources",
       "units": [
         "src/all/allporncomicsco",
         "src/all/comicsvalley",
