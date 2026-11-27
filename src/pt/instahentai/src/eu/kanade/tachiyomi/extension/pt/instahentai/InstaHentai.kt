@@ -33,7 +33,7 @@ abstract class InstaHentai : KeiSource() {
     }
 
     override suspend fun fetchMangaUpdate(manga: SManga, chapters: List<SChapter>, fetchDetails: Boolean, fetchChapters: Boolean) = client.get(getMangaUrl(manga)).asJsoup().let { document ->
-        eu.kanade.tachiyomi.source.model.SMangaUpdate(
+        keiyoushi.source.SMangaUpdate(
             if (fetchDetails) parseMangaDetails(document).apply { url = manga.url } else manga,
             if (fetchChapters) parseChapterList(document) else chapters,
         )

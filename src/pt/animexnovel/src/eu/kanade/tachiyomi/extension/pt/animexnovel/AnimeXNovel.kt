@@ -131,7 +131,7 @@ abstract class AnimeXNovel : KeiSource() {
     // ========================== Chapters ==================================
 
     override suspend fun fetchMangaUpdate(manga: SManga, chapters: List<SChapter>, fetchDetails: Boolean, fetchChapters: Boolean) = client.get(getMangaUrl(manga), Fetch.DOCUMENT).asJsoup().let { document ->
-        eu.kanade.tachiyomi.source.model.SMangaUpdate(
+        keiyoushi.source.SMangaUpdate(
             if (fetchDetails) parseMangaDetails(document, getMangaUrl(manga)) else manga,
             if (fetchChapters) fetchChapterList(document) else chapters,
         )

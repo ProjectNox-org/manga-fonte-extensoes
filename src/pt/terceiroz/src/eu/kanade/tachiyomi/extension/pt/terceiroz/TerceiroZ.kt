@@ -49,7 +49,7 @@ abstract class TerceiroZ : KeiSource() {
     override suspend fun getMangaByUrl(url: okhttp3.HttpUrl): SManga = parseMangaDetails(client.get(url).asJsoup(), url.toString())
 
     override suspend fun fetchMangaUpdate(manga: SManga, chapters: List<SChapter>, fetchDetails: Boolean, fetchChapters: Boolean) = client.get(getMangaUrl(manga)).asJsoup().let { doc ->
-        eu.kanade.tachiyomi.source.model.SMangaUpdate(
+        keiyoushi.source.SMangaUpdate(
             if (fetchDetails) parseMangaDetails(doc, getMangaUrl(manga)) else manga,
             if (fetchChapters) listOf(chapterFromUrl(getMangaUrl(manga))) else chapters,
         )

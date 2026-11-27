@@ -85,7 +85,7 @@ abstract class Kensscan :
         fetchDetails: Boolean,
         fetchChapters: Boolean,
     ): SMangaUpdate {
-        if (!fetchDetails) return SMangaUpdate(manga, super.fetchMangaUpdate(manga, chapters, false, fetchChapters).chapters)
+        if (!fetchDetails) return SMangaUpdate(manga, super.fetchMangaUpdate(manga, chapters, false, fetchChapters).chapters())
         val update = super.fetchMangaUpdate(manga, chapters, true, fetchChapters)
         return SMangaUpdate(
             manga = {
