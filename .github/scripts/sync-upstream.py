@@ -817,8 +817,6 @@ def preflight_multisrc(
     report: dict[str, list[dict[str, object]]] = {}
     blocked: set[str] = set()
     protected = set(protected_units)
-    for entry in deferred.values():
-        protected.update(str(unit) for unit in entry.get("units", []))
     for theme in sorted(changed_themes):
         local_multi = multisrc_metadata(None, theme)
         upstream_multi = multisrc_metadata(upstream_ref, theme)
@@ -1019,7 +1017,10 @@ def verify_migration_plan(
                     # so source equality alone is insufficient. Preserve any
                     # local Gradle, asset, or resource customization in the
                     # candidate and prove that reconciliation can build.
-                    preserve = rows_by_unit[unit].get("protected", False) or rows_by_unit[unit].get("unit_divergent", False)
+                    preserve = rows_by_unit[unit].get("protected", False) or (
+                        rows_by_unit[unit].get("unit_divergent", False)
+                        and not unit_matches_upstream_history(unit, upstream_ref)
+                    )
                     if not preserve:
                         result = subprocess.run(
                             ["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--worktree", "--staged", "--", unit],
