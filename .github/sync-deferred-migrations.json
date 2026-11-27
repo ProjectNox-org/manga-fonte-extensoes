@@ -1,11 +1,13 @@
 {
   "themes": {
     "aesir": {
+      "patch_base": "7f91c9da5944b7b334758f3c437797fe31fc616c",
+      "reason": "dependent shared with deferred theme",
       "units": [
         "src/id/kaguya",
         "src/id/kumopoi"
       ],
-      "upstream_ref": "upstream/main"
+      "upstream_ref": "7f91c9da5944b7b334758f3c437797fe31fc616c"
     },
     "aurora": {
       "patch_base": "1dfd0bcf25b48cb5bd42d9191918a29072c67a61",
@@ -283,15 +285,6 @@
         "src/vi/truyentranhdammy",
         "src/vi/truyentuoitho",
         "src/zh/bakamh"
-      ],
-      "upstream_ref": "7f91c9da5944b7b334758f3c437797fe31fc616c"
-    },
-    "mangotheme": {
-      "patch_base": "293eb3cdbf4ca73ff238ab54cec3f095a3bdbdc2",
-      "reason": "proof build/tests failed",
-      "units": [
-        "src/pt/bladetoons",
-        "src/pt/imperiodabritannia"
       ],
       "upstream_ref": "7f91c9da5944b7b334758f3c437797fe31fc616c"
     }
