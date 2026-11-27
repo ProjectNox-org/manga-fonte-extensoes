@@ -199,6 +199,52 @@ class GenerateBuildMatricesTest(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertEqual(m.group("lib"), "imagedecoder")
 
+    def test_deferred_aurora_units_excluded_from_matrix_and_deletions_on_core_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".github").mkdir(parents=True)
+            (root / ".github/sync-deferred-migrations.json").write_text(
+                json.dumps({
+                    "themes": {
+                        "aurora": {
+                            "reason": "functional conflict: Aurora.kt",
+                            "units": [
+                                "src/pt/leitordemangas",
+                                "src/pt/manganyx",
+                                "src/pt/mangasbrasuka",
+                                "src/pt/mugiwarasoficial",
+                            ],
+                        }
+                    }
+                })
+            )
+            for u in (
+                "src/pt/leitordemangas",
+                "src/pt/manganyx",
+                "src/pt/mangasbrasuka",
+                "src/pt/mugiwarasoficial",
+                "src/pt/xxxyaoi",
+            ):
+                (root / u).mkdir(parents=True)
+                (root / u / "build.gradle.kts").write_text('theme = "aurora"\n' if "xxx" not in u else "")
+
+            orig_cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                with patch.object(gbm, "run_command", return_value="M\tcore/src/main/kotlin/keiyoushi/source/KeiSource.kt\n"):
+                    modules, deleted = get_module_list("a..b")
+                all_mods, all_dels = gbm.get_all_modules()
+            finally:
+                os.chdir(orig_cwd)
+
+            for ext in ("leitordemangas", "manganyx", "mangasbrasuka", "mugiwarasoficial"):
+                self.assertNotIn(f":src:pt:{ext}", modules)
+                self.assertNotIn(f"pt.{ext}", deleted)
+                self.assertNotIn(f":src:pt:{ext}", all_mods)
+                self.assertNotIn(f"pt.{ext}", all_dels)
+            self.assertIn(":src:pt:xxxyaoi", modules)
+            self.assertIn("pt.xxxyaoi", deleted)
+
 
 if __name__ == "__main__":
     unittest.main()

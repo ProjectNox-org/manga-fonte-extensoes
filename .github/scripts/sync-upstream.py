@@ -3200,8 +3200,14 @@ def main() -> None:
         or settings_pending
     )
     if core_changed:
+        locked_deferred_units = {
+            str(u)
+            for entry in load_deferred_migrations().values()
+            if isinstance(entry, dict)
+            for u in entry.get("units", [])
+        }
         for pu in protected_units:
-            if pu.startswith("src/") and path_exists(None, pu):
+            if pu.startswith("src/") and pu not in locked_deferred_units and path_exists(None, pu):
                 upstream_units.append(pu)
         upstream_units = sorted(set(upstream_units))
 
