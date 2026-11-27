@@ -7,7 +7,7 @@ plugins {
 keiyoushi {
     name = "Punk Records"
     pkgName = "all.littlegarden"
-    versionCode = 4
+    versionCode = 5
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
 

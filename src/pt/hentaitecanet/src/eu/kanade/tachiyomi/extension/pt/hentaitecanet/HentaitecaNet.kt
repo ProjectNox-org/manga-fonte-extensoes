@@ -5,7 +5,7 @@ import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.model.SMangaUpdate
+import keiyoushi.source.SMangaUpdate
 import keiyoushi.annotation.Source
 import keiyoushi.network.get
 import keiyoushi.network.rateLimit
@@ -114,7 +114,7 @@ abstract class HentaitecaNet : KeiSource() {
         }
 
         val update = fetchMangaUpdate(manga, emptyList(), fetchDetails = true, fetchChapters = false)
-        return update.manga
+        return update.manga()
     }
 
     override suspend fun fetchMangaUpdate(

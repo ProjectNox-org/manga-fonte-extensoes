@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Jago Dibuja"
-    versionCode = 1
+    versionCode = 2
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
 

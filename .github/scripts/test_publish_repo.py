@@ -973,6 +973,81 @@ class PublisherTest(unittest.TestCase):
         self.assertEqual([key for key in before_modern if before_modern[key] != after_modern[key]], changed)
         print("PUBLIC SNAPSHOT PASS: zero removals/downgrades; only Geass changes: code 5 -> 6, version 1.6.5 -> 1.6.6, APK v1.6.5 -> v1.6.6; KariKari/OneReader unchanged")
 
+    def test_locked_deferred_aurora_cannot_be_deleted_or_republished(self):
+        aurora_ext = extension("mugiwarasoficial", 67)
+        aurora_ext.name = "Mugiwaras Oficial"
+        brasuka_ext = extension("mangasbrasuka", 12)
+        brasuka_ext.name = "Mangás Brasuka"
+        orphan_ext = extension("orcamanga", 20)
+        orphan_ext.packageName = "eu.kanade.tachiyomi.extension.ar.orcamanga"
+        orphan_ext.name = "OrcaManga"
+        other_ext = extension("geasscomics", 5)
+        modern = index_pb2.Index(extensionList=index_pb2.ExtensionList(extensions=[aurora_ext, brasuka_ext, orphan_ext, other_ext]))
+        old = [legacy(aurora_ext), legacy(brasuka_ext), legacy(orphan_ext), legacy(other_ext)]
+
+        # Attempt BOTH deleting all 4 locked Aurora units AND publishing a stray rebuilt APK alongside geasscomics
+        aurora_stray = extension("mugiwarasoficial", 99)
+        aurora_stray.name = "Mugiwaras Oficial"
+        other_update = extension("geasscomics", 6)
+
+        with tempfile.TemporaryDirectory(prefix="nox-aurora-lock-") as d:
+            root = Path(d)
+            (root / "index.json").write_text(json_format.MessageToJson(modern), encoding="utf-8")
+            (root / "index.min.json").write_text(json.dumps(old), encoding="utf-8")
+            for item in (aurora_stray, other_update):
+                slug = item.packageName.removeprefix(PREFIX)
+                mod = f"pt.{slug}"
+                build = root / "apk-artifacts" / mod / "build"
+                for kind in ("apk", "jar"):
+                    out = build / "outputs" / kind / "release"
+                    out.mkdir(parents=True)
+                    (out / f"tachiyomi-{mod}-v{item.versionName}.{kind}").write_bytes(b"asset-" + slug.encode())
+                info = json_format.MessageToDict(item, preserving_proto_field_name=True)
+                info["versionCode"] = int(info["versionCode"])
+                info["contentWarning"] = item.contentWarning
+                info["module"] = mod
+                info["sources"] = [{"id": s.id, "name": s.name, "lang": s.language, "baseUrl": s.homeUrl} for s in item.sources]
+                (build / "keiyoushi-source-info.json").write_text(json.dumps(info), encoding="utf-8")
+
+            prev = Path.cwd()
+            try:
+                os.chdir(root)
+                stdout = io.StringIO()
+                delete_arg = json.dumps(["pt.mugiwarasoficial", "pt.mangasbrasuka", "pt.leitordemangas", "pt.manganyx", "ar.orcamanga"])
+                with patch.object(Path, "home", return_value=root), \
+                     patch.object(github_utils, "run_gh", return_value='{"assets":[]}'), \
+                     patch("sys.argv", [str(SCRIPT), delete_arg, "abc1234"]), \
+                     patch("sys.stdout", stdout):
+                    try:
+                        runpy.run_path(str(SCRIPT), run_name="__main__")
+                    except SystemExit as e:
+                        self.assertEqual(e.code, 0)
+            finally:
+                os.chdir(prev)
+
+            output = stdout.getvalue()
+            self.assertIn("LOCKED_DEFERRED_DELETE_BLOCKED=eu.kanade.tachiyomi.extension.pt.mugiwarasoficial", output)
+            self.assertIn("LOCKED_DEFERRED_DELETE_BLOCKED=eu.kanade.tachiyomi.extension.pt.mangasbrasuka", output)
+            self.assertIn("PRESERVED_ORPHAN_DELETE_BLOCKED=eu.kanade.tachiyomi.extension.ar.orcamanga", output)
+            self.assertIn("LOCKED_DEFERRED_PUBLISH_BLOCKED=eu.kanade.tachiyomi.extension.pt.mugiwarasoficial", output)
+
+            cur = json_format.Parse((root / "index.json").read_text(), index_pb2.Index())
+            by_pkg = {e.packageName: e for e in cur.extensionList.extensions}
+            self.assertIn(aurora_ext.packageName, by_pkg)
+            self.assertIn(brasuka_ext.packageName, by_pkg)
+            self.assertIn(orphan_ext.packageName, by_pkg)
+            self.assertEqual(by_pkg[aurora_ext.packageName].versionCode, 106067)
+            self.assertEqual(by_pkg[aurora_ext.packageName].versionName, "1.6.67")
+            self.assertEqual(by_pkg[brasuka_ext.packageName].versionCode, 106012)
+            self.assertEqual(by_pkg[other_ext.packageName].versionCode, 106006)
+            self.assertEqual(by_pkg[other_ext.packageName].versionName, "1.6.6")
+
+            legacy_cur = json.loads((root / "index.min.json").read_text())
+            legacy_by_pkg = {e["pkg"]: e for e in legacy_cur}
+            self.assertEqual(legacy_by_pkg[aurora_ext.packageName]["version"], "1.6.67")
+            self.assertEqual(legacy_by_pkg[brasuka_ext.packageName]["version"], "1.6.12")
+            self.assertEqual(legacy_by_pkg[other_ext.packageName]["version"], "1.6.6")
+
 
 if __name__ == "__main__":
     unittest.main()

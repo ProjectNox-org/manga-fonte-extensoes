@@ -2093,14 +2093,16 @@ class BuildMatrixTest(unittest.TestCase):
 
     def test_e_aurora_builds_exactly_four_dependents(self):
         names = {"mangasbrasuka", "mugiwarasoficial", "leitordemangas", "manganyx"}
-        self.assertEqual(self.selected("lib-multisrc/aurora/build.gradle.kts"), (
-            {f":src:pt:{name}" for name in names}, {f"pt.{name}" for name in names},
-        ))
+        with patch.object(self.matrix, "load_deferred_locked_units", return_value=set()):
+            self.assertEqual(self.selected("lib-multisrc/aurora/build.gradle.kts"), (
+                {f":src:pt:{name}" for name in names}, {f"pt.{name}" for name in names},
+            ))
 
     def test_f_single_extension_stays_isolated(self):
-        self.assertEqual(self.selected("src/pt/mangasbrasuka/build.gradle.kts"), (
-            {":src:pt:mangasbrasuka"}, {"pt.mangasbrasuka"},
-        ))
+        with patch.object(self.matrix, "load_deferred_locked_units", return_value=set()):
+            self.assertEqual(self.selected("src/pt/mangasbrasuka/build.gradle.kts"), (
+                {":src:pt:mangasbrasuka"}, {"pt.mangasbrasuka"},
+            ))
 
 
 class UpstreamBatchAndObservabilityTest(unittest.TestCase):
@@ -2683,6 +2685,417 @@ class VersionCatalogAndLintProtectionTest(unittest.TestCase):
         new_head = self.git("rev-parse", "HEAD")
         self.assertNotEqual(new_head, "old_head")
         self.assertEqual(sync_upstream.get_code_sha("HEAD"), code_sha)
+
+
+class SyncRecoveryRegressionTest(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory(prefix="sync-recovery-test-")
+        self.repo = Path(self.tmpdir.name)
+        self.prev = Path.cwd()
+        os.chdir(self.repo)
+
+        def git(*args):
+            res = subprocess.run(["git", *args], cwd=self.repo, capture_output=True, text=True)
+            if res.returncode != 0:
+                raise RuntimeError(f"git {' '.join(args)} failed: {res.stderr}")
+            return res.stdout.strip()
+
+        self.git = git
+        self.git("init", "-b", "main")
+        self.git("config", "user.name", "Nox Recovery")
+        self.git("config", "user.email", "recovery@project-nox.test")
+
+    def tearDown(self):
+        os.chdir(self.prev)
+        self.tmpdir.cleanup()
+
+    def _write(self, rel_path: str, content: str) -> None:
+        p = self.repo / rel_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+
+    def test_unrelated_upstream_commit_deduplicates_without_rebuilding_or_committing(self):
+        self._write("core/src/main/kotlin/keiyoushi/source/MirrorPreferences.kt", "private val mirrors: List<Pair<String, String>> = emptyList()\n")
+        self._write("src/en/foo/Foo.kt", "package foo\n// v1\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "initial")
+        u1 = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "-b", "upstream-sim")
+        self._write("src/en/foo/Foo.kt", "package foo\n// v2\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "unrelated upstream extension edit")
+        u2 = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "main")
+        self.git("update-ref", "refs/remotes/origin/main", self.git("rev-parse", "HEAD"))
+        self.git("update-ref", "refs/remotes/upstream/main", u2)
+
+        self.assertFalse(sync_upstream.upstream_changes_affect_units(u1, u2, ["core"]))
+
+        code_sha = sync_upstream.get_code_sha("HEAD")
+        cause = "MirrorPreferencesTest.kt:63:52 private mirrors"
+        err_sig = sync_upstream.compute_error_signature(code_sha, "BLOCKED_STRUCTURAL", ["core"], cause)
+        sync_upstream.write_failure_signatures({
+            "error_signature": err_sig,
+            "local_head": self.git("rev-parse", "HEAD"),
+            "code_sha": code_sha,
+            "upstream_head": u1,
+            "state": "BLOCKED_STRUCTURAL",
+            "failed_units": ["core"],
+            "cause": cause,
+            "skip_count": 0,
+        })
+        head_before = self.git("rev-parse", "HEAD")
+        orig_git = sync_upstream.git
+
+        def fake_git(*args, **kw):
+            if args[:1] == ("fetch",):
+                return ""
+            return orig_git(*args, **kw)
+
+        with patch("sys.argv", ["sync-upstream.py", "--dry-run"]):
+            with patch.object(sync_upstream, "ensure_clean_tree"), \
+                 patch.object(sync_upstream, "ensure_upstream_remote"), \
+                 patch.object(sync_upstream, "apply_units") as mock_apply, \
+                 patch.object(sync_upstream, "git", side_effect=fake_git):
+                sync_upstream.main()
+                mock_apply.assert_not_called()
+
+        self.assertEqual(self.git("rev-parse", "HEAD"), head_before)
+        self.assertEqual(sync_upstream.load_failure_signatures()["skip_count"], 1)
+
+    def test_deduplicated_blocked_structural_exits_nonzero_under_push(self):
+        self._write("core/src/main/kotlin/keiyoushi/source/MirrorPreferences.kt", "private val mirrors = emptyList<Any>()\n")
+        self._write("src/en/foo/Foo.kt", "package foo\n// v1\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "initial")
+        u1 = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "-b", "upstream-sim")
+        self._write("src/en/foo/Foo.kt", "package foo\n// v2\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "unrelated upstream extension edit")
+        u2 = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "main")
+        self.git("update-ref", "refs/remotes/origin/main", self.git("rev-parse", "HEAD"))
+        self.git("update-ref", "refs/remotes/upstream/main", u2)
+
+        code_sha = sync_upstream.get_code_sha("HEAD")
+        cause = "MirrorPreferencesTest.kt:63:52 private mirrors"
+        err_sig = sync_upstream.compute_error_signature(code_sha, "BLOCKED_STRUCTURAL", ["core"], cause)
+        sync_upstream.write_failure_signatures({
+            "error_signature": err_sig,
+            "local_head": self.git("rev-parse", "HEAD"),
+            "code_sha": code_sha,
+            "upstream_head": u1,
+            "state": "BLOCKED_STRUCTURAL",
+            "failed_units": ["core"],
+            "cause": cause,
+            "skip_count": 0,
+        })
+        self.git("add", ".github/sync-failure-signatures.json")
+        self.git("commit", "-m", "record block")
+        self.git("update-ref", "refs/remotes/origin/main", self.git("rev-parse", "HEAD"))
+        commits_before = int(self.git("rev-list", "--count", "HEAD"))
+        orig_git = sync_upstream.git
+
+        def fake_git(*args, **kw):
+            if args[:1] == ("fetch",):
+                return ""
+            return orig_git(*args, **kw)
+
+        with patch("sys.argv", ["sync-upstream.py", "--push"]), \
+             patch.object(sync_upstream, "ensure_clean_tree"), \
+             patch.object(sync_upstream, "ensure_upstream_remote"), \
+             patch.object(sync_upstream, "git", side_effect=fake_git):
+            with self.assertRaises(SystemExit) as cm:
+                sync_upstream.main()
+            self.assertEqual(cm.exception.code, 1)
+
+        self.assertEqual(int(self.git("rev-list", "--count", "HEAD")), commits_before)
+
+    def test_same_error_signature_does_not_create_duplicate_skip_ci_commit(self):
+        self._write("core/Dummy.kt", "class Dummy\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "base")
+        u1 = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "-b", "upstream-core")
+        self._write("core/Dummy.kt", "class Dummy { val x = 1 }\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "upstream core touch")
+        u2 = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "main")
+        code_sha = sync_upstream.get_code_sha("HEAD")
+        cause = "deterministic core failure"
+        err_sig = sync_upstream.compute_error_signature(code_sha, "BLOCKED_STRUCTURAL", ["core"], cause)
+        sync_upstream.write_failure_signatures({
+            "error_signature": err_sig,
+            "local_head": self.git("rev-parse", "HEAD"),
+            "code_sha": code_sha,
+            "upstream_head": u1,
+            "state": "BLOCKED_STRUCTURAL",
+            "failed_units": ["core"],
+            "cause": cause,
+            "skip_count": 2,
+        })
+        self.git("add", ".")
+        self.git("commit", "-m", "[skip ci] chore: record deterministic sync failure block")
+        self.git("update-ref", "refs/remotes/origin/main", self.git("rev-parse", "HEAD"))
+        self.git("update-ref", "refs/remotes/upstream/main", u2)
+        commit_count_before = int(self.git("rev-list", "--count", "HEAD"))
+
+        err = sync_upstream.StructuralIncompatibilityError(cause, failed_units=["core"])
+        orig_git = sync_upstream.git
+
+        def fake_git(*args, **kw):
+            if args[:1] in {("fetch",), ("push",)}:
+                return ""
+            return orig_git(*args, **kw)
+
+        with patch("sys.argv", ["sync-upstream.py", "--push"]), \
+             patch.object(sync_upstream, "ensure_clean_tree"), \
+             patch.object(sync_upstream, "ensure_upstream_remote"), \
+             patch.object(sync_upstream, "apply_units", side_effect=err), \
+             patch.object(sync_upstream, "git", side_effect=fake_git):
+            with self.assertRaises(SystemExit) as cm:
+                sync_upstream.main()
+            self.assertEqual(cm.exception.code, 1)
+
+        self.assertEqual(int(self.git("rev-list", "--count", "HEAD")), commit_count_before)
+        self.assertEqual(sync_upstream.load_failure_signatures()["skip_count"], 3)
+
+    def test_ensure_core_compatibility_restores_mirror_visibility_and_okhttp_shims(self):
+        self._write(
+            "core/src/main/kotlin/keiyoushi/source/MirrorPreferences.kt",
+            "class MirrorPreferences(\n    private val preferences: SharedPreferences,\n    defaultMirrors: Array<Pair<String, String>>,\n    private val title: String,\n) : FetchableBaseUrl {\n    private val hardcodedUrls = defaultMirrors.joinToString(\",\") { it.second }\n    private val mirrors: List<Pair<String, String>>\n        get() = defaultMirrors.asList()\n}\n",
+        )
+        self._write(
+            "core/src/main/kotlin/keiyoushi/network/OkHttp.kt",
+            "package keiyoushi.network\nfun head() = Unit\n",
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "core overwrite")
+        sync_upstream.ensure_core_compatibility()
+        mirror_text = (self.repo / "core/src/main/kotlin/keiyoushi/source/MirrorPreferences.kt").read_text()
+        okhttp_text = (self.repo / "core/src/main/kotlin/keiyoushi/network/OkHttp.kt").read_text()
+        self.assertIn("val mirrors: List<Pair<String, String>>", mirror_text)
+        self.assertNotIn("private val mirrors: List<Pair<String, String>>", mirror_text)
+        self.assertIn("mirrors: Array<Pair<String, String>> = defaultMirrors", mirror_text)
+        self.assertIn("Backwards compatibility for Nox extensions", okhttp_text)
+
+    def test_verify_migration_plan_restores_new_upstream_unit_absent_on_head(self):
+        self._write("gradlew", "#!/bin/sh\nexit 0\n")
+        Path(self.repo / "gradlew").chmod(0o755)
+        self.git("add", ".")
+        self.git("commit", "-m", "base")
+
+        self.git("checkout", "-b", "upstream-catharsis")
+        self._write(
+            "lib-multisrc/catharsis/build.gradle.kts",
+            'ext {\n    isNsfw = false\n}\next {\n    set("libVersion", "1.6")\n}\nbaseVersionCode = 2\n',
+        )
+        self._write(
+            "src/es/aedex/build.gradle.kts",
+            'ext {\n    extName = "Aedex"\n    theme = "catharsis"\n    libVersion = "1.6"\n    versionCode = 1\n}\n',
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "upstream add catharsis and aedex")
+        up_sha = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "main")
+        self.git("merge", "--no-ff", "-s", "ours", "-m", "deferred ours", up_sha)
+        sync_upstream.write_deferred_migrations({"catharsis": {"upstream_ref": up_sha, "units": ["src/es/aedex"]}})
+        self.git("add", ".")
+        self.git("commit", "-m", "record deferred catharsis")
+
+        report = {
+            "catharsis": [{
+                "unit": "src/es/aedex",
+                "protected": False,
+                "local_libVersion": None,
+                "upstream_libVersion": "1.6",
+                "multisrc_libVersion": "1.6",
+                "libVersion_downgrade": False,
+                "source_divergent": True,
+                "unit_divergent": True,
+                "migration_required": True,
+                "migration_supported": True,
+            }],
+        }
+        res = sync_upstream.verify_migration_plan(report, up_sha)
+        self.assertEqual(res.blocked, set())
+        self.assertIn("catharsis", res.proven)
+
+    def test_prove_protected_multisrc_allows_unprotected_dependent_switching_to_new_theme(self):
+        self._write("gradlew", "#!/bin/sh\nexit 0\n")
+        Path(self.repo / "gradlew").chmod(0o755)
+        self._write(
+            "lib-multisrc/madara/build.gradle.kts",
+            'val libVersion = "1.6"\nval baseVersionCode = 1\n',
+        )
+        self._write("lib-multisrc/madara/src/Madara.kt", "// base\n")
+        self._write(
+            "src/id/kaguya/build.gradle.kts",
+            'ext {\n    extName = "Kaguya"\n    theme = "madara"\n    libVersion = "1.6"\n    versionCode = 1\n}\n',
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "base")
+        base_sha = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "-b", "upstream-madara")
+        self._write(
+            "lib-multisrc/madara/build.gradle.kts",
+            'val libVersion = "1.6"\nval baseVersionCode = 2\n',
+        )
+        self._write(
+            "lib-multisrc/aesir/build.gradle.kts",
+            'val libVersion = "1.6"\nval baseVersionCode = 1\n',
+        )
+        self._write(
+            "src/id/kaguya/build.gradle.kts",
+            'ext {\n    extName = "Kaguya"\n    theme = "aesir"\n    libVersion = "1.6"\n    versionCode = 2\n}\n',
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "upstream move kaguya to aesir")
+
+        self.git("checkout", "main")
+        self._write("lib-multisrc/madara/src/Madara.kt", "// base\n// nox tweak\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "nox madara customization")
+
+        accepted, deferred = sync_upstream.prove_protected_multisrc(base_sha, "upstream-madara", [], set())
+        self.assertIn("madara", accepted)
+        self.assertNotIn("madara", deferred)
+
+    def test_prove_protected_multisrc_preserves_protected_unit_on_different_local_theme(self):
+        self._write("gradlew", "#!/bin/sh\nexit 0\n")
+        Path(self.repo / "gradlew").chmod(0o755)
+        self._write(
+            "lib-multisrc/madara/build.gradle.kts",
+            'val libVersion = "1.6"\nval baseVersionCode = 1\n',
+        )
+        self._write("lib-multisrc/madara/src/Madara.kt", "// base\n")
+        self._write(
+            "lib-multisrc/zeistmanga/build.gradle.kts",
+            'val libVersion = "1.6"\nval baseVersionCode = 1\n',
+        )
+        self._write(
+            "src/pt/yaoifanclub/build.gradle.kts",
+            'ext {\n    extName = "YaoiFanClub"\n    theme = "madara"\n    libVersion = "1.6"\n    versionCode = 1\n}\n',
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "base")
+        base_sha = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "-b", "upstream-madara2")
+        self._write(
+            "lib-multisrc/madara/build.gradle.kts",
+            'val libVersion = "1.6"\nval baseVersionCode = 2\n',
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "upstream bump madara")
+
+        self.git("checkout", "main")
+        self._write(".github/nox-protected.txt", "src/pt/yaoifanclub\n")
+        self._write("lib-multisrc/madara/src/Madara.kt", "// base\n// nox tweak\n")
+        self._write(
+            "src/pt/yaoifanclub/build.gradle.kts",
+            'ext {\n    extName = "YaoiFanClub"\n    theme = "zeistmanga"\n    libVersion = "1.6"\n    versionCode = 2\n}\n',
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "nox migrated yaoifanclub to zeistmanga")
+
+        accepted, deferred = sync_upstream.prove_protected_multisrc(base_sha, "upstream-madara2", ["src/pt/yaoifanclub"], set())
+        self.assertIn("madara", accepted)
+        self.assertNotIn("madara", deferred)
+        gradle_in_tree = subprocess.check_output(
+            ["git", "show", f"{accepted['madara']['tree']}:src/pt/yaoifanclub/build.gradle.kts"],
+            text=True,
+        )
+        self.assertIn('theme = "zeistmanga"', gradle_in_tree)
+
+    def test_prove_protected_multisrc_updates_lagging_unprotected_dependent_matching_upstream_history(self):
+        self._write("gradlew", "#!/bin/sh\nexit 0\n")
+        Path(self.repo / "gradlew").chmod(0o755)
+        self._write(
+            "lib-multisrc/madara/build.gradle.kts",
+            'val libVersion = "1.6"\nval baseVersionCode = 1\n',
+        )
+        self._write("lib-multisrc/madara/src/Madara.kt", "// v1\n")
+        self._write(
+            "src/en/kensscan/build.gradle.kts",
+            'ext {\n    extName = "Kensscan"\n    theme = "madara"\n    libVersion = "1.6"\n    versionCode = 1\n}\n',
+        )
+        self._write("src/en/kensscan/src/Kensscan.kt", "// old upstream v1\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "v1")
+        v1 = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "-b", "upstream-madara3")
+        self._write(
+            "lib-multisrc/madara/build.gradle.kts",
+            'val libVersion = "1.6"\nval baseVersionCode = 2\n',
+        )
+        self._write(
+            "src/en/kensscan/build.gradle.kts",
+            'ext {\n    extName = "Kensscan"\n    theme = "madara"\n    libVersion = "1.6"\n    versionCode = 2\n}\n',
+        )
+        self._write("src/en/kensscan/src/Kensscan.kt", "// updated upstream v2\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "upstream v2")
+        v2 = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "main")
+        # Simulate prior -s ours merge where base == upstream (v2) while kensscan remained at v1
+        self.git("merge", "--no-ff", "-s", "ours", "-m", "deferred ours", v2)
+        sync_upstream.write_deferred_migrations({"madara": {"patch_base": v1, "upstream_ref": v2, "units": ["src/en/kensscan"]}})
+        self._write("lib-multisrc/madara/src/Madara.kt", "// v1\n// nox tweak\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "nox tweak")
+
+        accepted, deferred = sync_upstream.prove_protected_multisrc(v2, v2, [], set())
+        self.assertIn("madara", accepted)
+        self.assertNotIn("madara", deferred)
+        kensscan_in_tree = subprocess.check_output(
+            ["git", "show", f"{accepted['madara']['tree']}:src/en/kensscan/src/Kensscan.kt"],
+            text=True,
+        )
+        self.assertIn("updated upstream v2", kensscan_in_tree)
+
+    def test_prove_protected_multisrc_skips_spotless_tasks_only_for_gradle_repo_layout(self):
+        self._write(
+            "gradlew",
+            "#!/usr/bin/env python3\nimport sys\nassert '-x' in sys.argv and 'spotlessApply' in sys.argv\n",
+        )
+        Path(self.repo / "gradlew").chmod(0o755)
+        self._write("gradle/libs.versions.toml", "# gradle dir marker\n")
+        self._write("lib-multisrc/madara/build.gradle.kts", 'val libVersion = "1.6"\nval baseVersionCode = 1\n')
+        self._write("lib-multisrc/madara/src/Madara.kt", "// base\n")
+        self._write(
+            "src/pt/sample/build.gradle.kts",
+            'ext {\n    theme = "madara"\n    libVersion = "1.6"\n    versionCode = 1\n}\n',
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "base")
+        base_sha = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "-b", "upstream-spotless")
+        self._write("lib-multisrc/madara/build.gradle.kts", 'val libVersion = "1.6"\nval baseVersionCode = 2\n')
+        self.git("add", ".")
+        self.git("commit", "-m", "upstream madara")
+
+        self.git("checkout", "main")
+        self._write("lib-multisrc/madara/src/Madara.kt", "// base\n// nox tweak\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "nox tweak")
+
+        accepted, deferred = sync_upstream.prove_protected_multisrc(base_sha, "upstream-spotless", ["src/pt/sample"], set())
+        self.assertIn("madara", accepted)
+        self.assertNotIn("madara", deferred)
 
 
 if __name__ == "__main__":

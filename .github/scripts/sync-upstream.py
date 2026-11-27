@@ -619,6 +619,52 @@ def compute_deterministic_signature(
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
+def compute_error_signature(
+    code_sha: str,
+    failure_type: str,
+    units: list[str],
+    cause: str,
+) -> str:
+    """Compute a stable failure signature independent of unrelated upstream commits."""
+    seed = f"{code_sha}:{failure_type}:{','.join(sorted(units))}:{cause}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
+def upstream_changes_affect_units(
+    prev_upstream_head: str,
+    current_upstream_head: str,
+    failed_units: list[str],
+) -> bool:
+    """Return True unless upstream diff between prev and current avoids all failure-relevant paths."""
+    if not prev_upstream_head or prev_upstream_head == current_upstream_head:
+        return True
+    diff = subprocess.run(
+        ["git", "diff", "--name-only", prev_upstream_head, current_upstream_head],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if diff.returncode != 0:
+        return True
+    relevant_prefixes = (
+        "core/",
+        "build-logic/",
+        "gradle/",
+        ".github/scripts/sync-upstream.py",
+        "settings.gradle.kts",
+        *[f"{u.rstrip('/')}/" for u in failed_units if u and u != "gradle-infra"],
+    )
+    for changed_path in (getattr(diff, "stdout", "") or "").splitlines():
+        path = changed_path.strip()
+        if not path:
+            continue
+        if path in {"settings.gradle.kts", ".github/scripts/sync-upstream.py"}:
+            return True
+        if any(path == p.rstrip("/") or path.startswith(p) for p in relevant_prefixes):
+            return True
+    return False
+
+
 class StructuralIncompatibilityError(RuntimeError):
     def __init__(self, message: str, failed_units: list[str] | None = None):
         super().__init__(message)
@@ -771,8 +817,6 @@ def preflight_multisrc(
     report: dict[str, list[dict[str, object]]] = {}
     blocked: set[str] = set()
     protected = set(protected_units)
-    for entry in deferred.values():
-        protected.update(str(unit) for unit in entry.get("units", []))
     for theme in sorted(changed_themes):
         local_multi = multisrc_metadata(None, theme)
         upstream_multi = multisrc_metadata(upstream_ref, theme)
@@ -973,7 +1017,13 @@ def verify_migration_plan(
                     # so source equality alone is insufficient. Preserve any
                     # local Gradle, asset, or resource customization in the
                     # candidate and prove that reconciliation can build.
-                    preserve = rows_by_unit[unit].get("protected", False) or rows_by_unit[unit].get("unit_divergent", False)
+                    preserve = path_exists("HEAD", unit) and (
+                        rows_by_unit[unit].get("protected", False)
+                        or (
+                            rows_by_unit[unit].get("unit_divergent", False)
+                            and not unit_matches_upstream_history(unit, upstream_ref)
+                        )
+                    )
                     if not preserve:
                         result = subprocess.run(
                             ["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--worktree", "--staged", "--", unit],
@@ -1011,7 +1061,8 @@ def verify_migration_plan(
                 # Metadata generation does not compile the protected source and
                 # therefore cannot prove a libVersion API migration is safe.
                 tasks = [f":{unit.replace('/', ':')}:assembleDebug" for unit in units]
-                result = subprocess.run([str(sandbox / "gradlew"), *tasks], cwd=sandbox, text=True)
+                spotless_skips = ["-x", "spotlessApply", "-x", "spotlessCheck"] if (sandbox / "gradle").is_dir() else []
+                result = subprocess.run([str(sandbox / "gradlew"), *spotless_skips, *tasks], cwd=sandbox, text=True)
                 if result.returncode:
                     blocked.add(theme)
                     continue
@@ -1767,7 +1818,31 @@ def prune_project_dependency_from_build_file(build_file: Path, project_path: str
 
 
 def ensure_core_compatibility() -> None:
-    """Ensure keiyoushi.network compatibility layer for Nox extensions is intact."""
+    """Ensure keiyoushi.network & MirrorPreferences compatibility layer for Nox extensions is intact."""
+    mirror_file = Path("core/src/main/kotlin/keiyoushi/source/MirrorPreferences.kt")
+    if mirror_file.exists():
+        m_text = mirror_file.read_text()
+        updated_m = m_text
+        if "private val mirrors: List<Pair<String, String>>" in updated_m:
+            updated_m = updated_m.replace(
+                "private val mirrors: List<Pair<String, String>>",
+                "val mirrors: List<Pair<String, String>>",
+                1,
+            )
+        if "mirrors: Array<Pair<String, String>> = defaultMirrors" not in updated_m and "    defaultMirrors: Array<Pair<String, String>>," in updated_m:
+            updated_m = updated_m.replace(
+                "    defaultMirrors: Array<Pair<String, String>>,\n    private val title: String,",
+                "    defaultMirrors: Array<Pair<String, String>> = emptyArray(),\n    private val title: String,\n    mirrors: Array<Pair<String, String>> = defaultMirrors,",
+                1,
+            ).replace(
+                "    private val hardcodedUrls = defaultMirrors.joinToString(",
+                "    private val effectiveDefaultMirrors: Array<Pair<String, String>> =\n        if (defaultMirrors.isNotEmpty()) defaultMirrors else mirrors\n    private val hardcodedUrls = effectiveDefaultMirrors.joinToString(",
+                1,
+            ).replace("?: defaultMirrors.asList()", "?: effectiveDefaultMirrors.asList()")
+        if updated_m != m_text:
+            mirror_file.write_text(updated_m)
+            git("add", "--", str(mirror_file), check=False)
+
     okhttp_file = Path("core/src/main/kotlin/keiyoushi/network/OkHttp.kt")
     if not okhttp_file.exists():
         return
@@ -1844,7 +1919,7 @@ suspend fun OkHttpClient.post(
 ): Response = post(url.toHttpUrl(), source.headers, Fetch.NONE, body, ensureSuccess)
 """
     okhttp_file.write_text(text + "\n" + compat_code)
-    run_cmd(["git", "add", "--", str(okhttp_file)], check=False)
+    git("add", "--", str(okhttp_file), check=False)
 
 
 def validate_infra_builds() -> None:
@@ -2151,18 +2226,52 @@ def prove_protected_multisrc(
                     if path_exists(upstream_ref, normal):
                         subprocess.run(["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--staged", "--worktree", "--", normal], check=True)
                 merge_multisrc(sandbox, theme, patch_base, upstream_ref)
+                build_dependents = []
+                owned_dependents = []
                 for dependent in dependents:
+                    local_meta = structural_metadata(None, dependent)
                     target = structural_metadata(upstream_ref, dependent)
-                    preserve = dependent in protected_units or dependent in local_changed or target is None
+                    exists_in_sandbox = (sandbox / dependent / "build.gradle.kts").exists()
+                    preserve = exists_in_sandbox and (
+                        dependent in protected_units
+                        or (dependent in local_changed and not unit_matches_upstream_history(dependent, upstream_ref))
+                        or target is None
+                    )
                     if preserve:
-                        if target:
+                        # If a protected/localized extension moved to another multisrc theme locally
+                        # (e.g., madara -> zeistmanga), never coerce its theme selector back to `theme`.
+                        if local_meta and local_meta[0] != theme:
+                            continue
+                        if target and target[0] == theme:
                             apply_structural_metadata_to_path(sandbox / dependent / "build.gradle.kts", *target)
+                        elif target and not (local_meta and local_meta[0] == theme):
+                            apply_structural_metadata_to_path(sandbox / dependent / "build.gradle.kts", *target)
+                        owned_dependents.append(dependent)
+                        if (sandbox / dependent / "build.gradle.kts").exists():
+                            build_dependents.append(dependent)
                     else:
                         subprocess.run(["git", "-C", str(sandbox), "rm", "-r", "--ignore-unmatch", "--quiet", "--", dependent], check=True)
-                        subprocess.run(["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--staged", "--worktree", "--", dependent], check=True)
+                        if path_exists(upstream_ref, dependent):
+                            subprocess.run(["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--staged", "--worktree", "--", dependent], check=True)
+                            if target and target[0] and target[0] != theme and path_exists(upstream_ref, f"lib-multisrc/{target[0]}"):
+                                subprocess.run(
+                                    ["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--worktree", "--", f"lib-multisrc/{target[0]}"],
+                                    check=True,
+                                )
+                            else:
+                                owned_dependents.append(dependent)
+                                if (sandbox / dependent / "build.gradle.kts").exists():
+                                    build_dependents.append(dependent)
+                        else:
+                            # Unprotected unit removed upstream must still be pruned by this theme migration.
+                            owned_dependents.append(dependent)
                 if Path("local.properties").exists():
                     shutil.copy("local.properties", sandbox / "local.properties")
-                for dependent in dependents:
+                active_dependents = [
+                    dependent for dependent in owned_dependents
+                    if (sandbox / dependent / "build.gradle.kts").exists()
+                ]
+                for dependent in active_dependents:
                     metadata = (sandbox / dependent / "build.gradle.kts").read_text()
                     selector, lib = _THEME_RE.search(metadata), _LIB_VERSION_RE.search(metadata)
                     if selector:
@@ -2170,18 +2279,19 @@ def prove_protected_multisrc(
                         selected_lib = _LIB_VERSION_RE.search(selected.read_text()) if selected.exists() else None
                         if not lib or not selected_lib or lib.group(1) != selected_lib.group(1):
                             raise ValueError(f"incompatible dependent selector: {dependent}")
-                paths = [unit, *dependents]
+                paths = [unit, *active_dependents]
                 subprocess.run(["git", "-C", str(sandbox), "add", "-A", "--", *paths], check=True)
                 tree = subprocess.run(["git", "-C", str(sandbox), "write-tree"], capture_output=True, text=True, check=True).stdout.strip()
-                tasks = [f":{dependent.replace('/', ':')}:assembleDebug" for dependent in dependents]
+                tasks = [f":{dependent.replace('/', ':')}:assembleDebug" for dependent in build_dependents]
                 tasks.append(f":lib-multisrc:{theme}:testDebugUnitTest")
-                proof = subprocess.run([str(sandbox / "gradlew"), *tasks], cwd=sandbox)
+                spotless_skips = ["-x", "spotlessApply", "-x", "spotlessCheck"] if (sandbox / "gradle").is_dir() else []
+                proof = subprocess.run([str(sandbox / "gradlew"), *spotless_skips, *tasks], cwd=sandbox)
                 if proof.returncode:
                     raise ValueError("proof build/tests failed")
                 if subprocess.run(["git", "-C", str(sandbox), "diff", "--quiet", tree, "--", *paths]).returncode:
                     raise ValueError("build changed candidate sources")
-                accepted[theme] = {"tree": tree, "units": dependents}
-                print(f"Protected Nox multisrc proven: {theme} ({len(dependents)} dependents)")
+                accepted[theme] = {"tree": tree, "units": owned_dependents, "all_units": dependents}
+                print(f"Protected Nox multisrc proven: {theme} ({len(owned_dependents)} dependents)")
             except (ValueError, OSError, subprocess.CalledProcessError) as error:
                 deferred[theme] = dict(entry, reason=str(error))
                 print(f"Protected Nox multisrc deferred: {theme}: {error}")
@@ -2196,7 +2306,10 @@ def propagate_multisrc_deferrals(proven, deferred, blocked, bases, upstream_ref)
     base_commit = git("merge-base", "HEAD", upstream_ref).strip()
     while True:
         blocked_units = {unit for theme in blocked for unit in local.get(theme, []) + upstream.get(theme, [])}
-        affected = [theme for theme, candidate in proven.items() if blocked_units.intersection(candidate["units"])]
+        affected = [
+            theme for theme, candidate in proven.items()
+            if blocked_units.intersection(candidate.get("all_units", candidate["units"]))
+        ]
         if not affected:
             return
         for theme in affected:
@@ -2205,7 +2318,7 @@ def propagate_multisrc_deferrals(proven, deferred, blocked, bases, upstream_ref)
             deferred[theme] = {
                 "patch_base": bases.get(theme, base_commit),
                 "upstream_ref": git("rev-parse", upstream_ref).strip(),
-                "units": candidate["units"],
+                "units": candidate.get("all_units", candidate["units"]),
                 "reason": "dependent shared with deferred theme",
             }
 
@@ -2415,6 +2528,7 @@ def apply_units(
     exception so a failed structural migration cannot leave an index or
     working tree half-applied.
     """
+    start_head = git("rev-parse", "HEAD").strip()
     try:
         return _apply_units(
             upstream_ref,
@@ -2429,6 +2543,9 @@ def apply_units(
     except BaseException:
         if merge_in_progress():
             git("merge", "--abort", check=False)
+        if git("rev-parse", "HEAD").strip() == start_head:
+            git("reset", "--hard", "HEAD", check=False)
+            git("clean", "-fdq", check=False)
         raise
 
 
@@ -2521,7 +2638,7 @@ def _apply_units(
             # unit. Otherwise retain all local files and merge selectors; the
             # build validation below is the proof that this reconciliation is
             # compatible before the transaction can be committed.
-            preserve_local_unit = unit_divergent and not unit_matches_upstream_history(unit, upstream_ref)
+            preserve_local_unit = path_exists("HEAD", unit) and unit_divergent and not unit_matches_upstream_history(unit, upstream_ref)
             if preserve_local_unit:
                 print(f"Preserving local files outside upstream history: {unit}")
                 changed = merge_structural_metadata(unit, upstream_ref)
@@ -2626,20 +2743,25 @@ def _apply_units(
                     git("add", "--", f"{unit}/build.gradle.kts")
 
     bumped = []
+    seen_proven: set[str] = set()
     for theme, candidate in proven_multisrc.items():
         for unit in [f"lib-multisrc/{theme}", *candidate["units"]]:
+            if unit in seen_proven:
+                continue
+            seen_proven.add(unit)
             # This tree was built successfully with the upstream multisrc metadata
             # and the preserved Nox source. Apply it before the generic version
             # guard, which must not block an atomic structural migration.
-            git("rm", "-r", "--ignore-unmatch", "--quiet", "--", unit)
-            git("restore", f"--source={candidate['tree']}", "--staged", "--worktree", "--", unit)
-            if unit.startswith("src/"):
-                validation_units.add(unit)
-            if unit in previous_versions and bump_after_structural_change(unit, previous_versions[unit]):
-                git("add", "--", f"{unit}/build.gradle.kts")
-                current_info = effective_version_code(None, unit)
-                if current_info:
-                    bumped.append(f"{unit} -> versionCode={current_info.raw}")
+            git("rm", "-r", "-f", "--ignore-unmatch", "--quiet", "--", unit)
+            if path_exists(candidate["tree"], unit):
+                git("restore", f"--source={candidate['tree']}", "--staged", "--worktree", "--", unit)
+                if unit.startswith("src/"):
+                    validation_units.add(unit)
+                if unit in previous_versions and bump_after_structural_change(unit, previous_versions[unit]):
+                    git("add", "--", f"{unit}/build.gradle.kts")
+                    current_info = effective_version_code(None, unit)
+                    if current_info:
+                        bumped.append(f"{unit} -> versionCode={current_info.raw}")
 
     # Deferred themes may no longer appear in base..upstream after an ours merge.
     # Their protected extensions must still receive their proven selector migration.
@@ -2816,6 +2938,7 @@ def _write_step_summary(
     bumped: list[str],
     deferred_incompatibilities: dict[str, dict[str, object]] | None = None,
     sync_state: str = "SYNCED",
+    protected_states: dict[str, str] | None = None,
 ) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
@@ -2825,11 +2948,14 @@ def _write_step_summary(
         lines.append("### Nox Protected Extensions\n\n")
         for unit in protected_units:
             tag = next((b for b in bumped if b.startswith(unit)), None)
+            pstate = (protected_states or {}).get(unit)
             if tag:
                 ver = tag.split("=")[1]
                 lines.append(f"- `{unit}` (kept Nox code, bumped to `{ver}`)\n")
+            elif pstate == "PROTECTED_UPDATE_PENDING":
+                lines.append(f"- `{unit}` (kept Nox code; upstream updates pending selective review)\n")
             else:
-                lines.append(f"- `{unit}` (kept Nox code, version already ahead)\n")
+                lines.append(f"- `{unit}` (kept Nox code, {pstate or 'version already ahead'})\n")
 
     if deferred_incompatibilities:
         lines.append("\n### Deferred Incompatible Modules\n\n")
@@ -2842,7 +2968,6 @@ def _write_step_summary(
             )
 
     with open(summary_path, "a", encoding="utf-8") as f:
-        f.writelines(lines)
         f.writelines(lines)
 
 
@@ -2951,23 +3076,32 @@ def main() -> None:
         signatures.get("local_head") == sync_head
         or (bool(signatures.get("code_sha")) and signatures.get("code_sha") == code_sha)
     )
+    prev_upstream_head = str(signatures.get("upstream_head") or "")
+    failed_units_list = [str(u) for u in signatures.get("failed_units", [])]
+    upstream_affected = (
+        prev_upstream_head != upstream_head
+        and upstream_changes_affect_units(prev_upstream_head, upstream_head, failed_units_list)
+    )
     if (
         signatures
         and same_local
-        and signatures.get("upstream_head") == upstream_head
+        and bool(prev_upstream_head)
+        and not upstream_affected
     ):
         recorded_state = signatures.get("state", "BLOCKED_STRUCTURAL")
-        skip_count = signatures.get("skip_count", 0) + 1
+        skip_count = int(signatures.get("skip_count", 0)) + 1
         signatures["skip_count"] = skip_count
         write_failure_signatures(signatures)
         print("==================================================")
         print("DEDUPLICATED DETERMINISTIC FAILURE DETECTED")
         print(f"State: {recorded_state}")
         print(f"Cause: {signatures.get('cause')}")
-        print(f"Inputs unchanged (local={code_sha[:10]}, upstream={upstream_head[:10]}). Skip count: {skip_count}")
+        print(f"Failure scope unchanged (local={code_sha[:10]}, upstream={upstream_head[:10]}). Skip count: {skip_count}")
         print("Skipping redundant full build to avoid CI failure loops.")
         print("==================================================")
         print_observability_footer(recorded_state, "SKIPPED", "SKIPPED")
+        if not args.dry_run and (args.push or args.apply_no_push) and str(recorded_state).startswith("BLOCKED"):
+            sys.exit(1)
         return
 
     base = git("merge-base", "HEAD", upstream_ref).strip()
@@ -3068,8 +3202,14 @@ def main() -> None:
         or settings_pending
     )
     if core_changed:
+        locked_deferred_units = {
+            str(u)
+            for entry in load_deferred_migrations().values()
+            if isinstance(entry, dict)
+            for u in entry.get("units", [])
+        }
         for pu in protected_units:
-            if pu.startswith("src/") and path_exists(None, pu):
+            if pu.startswith("src/") and pu not in locked_deferred_units and path_exists(None, pu):
                 upstream_units.append(pu)
         upstream_units = sorted(set(upstream_units))
 
@@ -3154,21 +3294,38 @@ def main() -> None:
         print(f"Structural incompatibility: {error}", file=sys.stderr)
         if merge_in_progress():
             git("merge", "--abort", check=False)
+        error_sig = compute_error_signature(
+            code_sha, "BLOCKED_STRUCTURAL", error.failed_units, str(error)
+        )
         sig = compute_deterministic_signature(
             code_sha, upstream_head, "BLOCKED_STRUCTURAL", error.failed_units, str(error)
         )
+        same_recorded_block = (
+            signatures.get("code_sha") == code_sha
+            and (
+                signatures.get("error_signature") == error_sig
+                or (
+                    not signatures.get("error_signature")
+                    and signatures.get("state") == "BLOCKED_STRUCTURAL"
+                    and sorted(str(u) for u in signatures.get("failed_units", [])) == sorted(error.failed_units)
+                    and signatures.get("cause") == str(error)
+                )
+            )
+        )
+        skip_count = (int(signatures.get("skip_count", 0)) + 1) if same_recorded_block else 0
         write_failure_signatures({
             "last_signature": sig,
-            "local_head": local_head,
+            "error_signature": error_sig,
+            "local_head": sync_head,
             "code_sha": code_sha,
             "upstream_head": upstream_head,
             "state": "BLOCKED_STRUCTURAL",
             "failed_units": error.failed_units,
             "cause": str(error),
             "recorded_at": datetime.now(timezone.utc).isoformat(),
-            "skip_count": 0,
+            "skip_count": skip_count,
         })
-        if args.push:
+        if args.push and not same_recorded_block:
             try:
                 ensure_main_unchanged(start_main)
                 git("add", "--", str(FAILURE_SIGNATURES_FILE))
@@ -3178,6 +3335,10 @@ def main() -> None:
                     print(f"Persisted deterministic sync block in {FAILURE_SIGNATURES_FILE} (code={code_sha[:10]}).")
             except Exception as exc:
                 print(f"Warning: could not persist deterministic failure signature remotely: {exc}", file=sys.stderr)
+        elif args.push and same_recorded_block:
+            print(
+                f"DEDUPLICATED: error_signature={error_sig[:12]} unchanged; skipping duplicate [skip ci] commit/push.",
+            )
         print_observability_footer("BLOCKED_STRUCTURAL", "SKIPPED", "SKIPPED")
         sys.exit(1)
 
@@ -3187,11 +3348,17 @@ def main() -> None:
     if FAILURE_SIGNATURES_FILE.exists():
         FAILURE_SIGNATURES_FILE.unlink()
 
+    protected_states = {
+        pu: classify_extension_sync_state(pu, upstream_ref, base=base, protected=protected_units)
+        for pu in protected_units
+        if pu.startswith("src/") and path_exists(None, pu)
+    }
     _write_step_summary(
         protected_units,
         bumped,
         deferred_incompatibilities=deferred_incompats,
         sync_state=sync_state,
+        protected_states=protected_states,
     )
     print(f"Commit Sync upstream: {git('rev-parse', 'HEAD').strip()}")
     if args.push:

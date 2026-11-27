@@ -16,6 +16,57 @@ CORE_FILES_REGEX = re.compile(
 )
 
 
+def load_deferred_locked_units() -> set[str]:
+    """Return extension units (e.g. 'src/pt/mugiwarasoficial') locked by deferred migrations."""
+    deferred_file = Path(".github/sync-deferred-migrations.json")
+    if not deferred_file.is_file():
+        return set()
+    try:
+        data = json.loads(deferred_file.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    themes = data.get("themes", {})
+    if not isinstance(themes, dict):
+        return set()
+    locked: set[str] = set()
+    for entry in themes.values():
+        if isinstance(entry, dict):
+            for unit in entry.get("units", []):
+                if isinstance(unit, str) and unit.startswith("src/"):
+                    locked.add(unit)
+    return locked
+
+
+def load_preserved_orphan_units() -> set[str]:
+    """Return module selectors (e.g. 'ar.orcamanga') preserved in catalog pending future cleanup."""
+    orphans_file = Path(".github/catalog-preserved-orphans.json")
+    if not orphans_file.is_file():
+        return set()
+    try:
+        data = json.loads(orphans_file.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    units = data.get("units", [])
+    if not isinstance(units, list):
+        return set()
+    return {
+        str(u).removeprefix("src/").replace("/", ".")
+        for u in units
+        if isinstance(u, str) and u.strip()
+    }
+
+
+def _filter_locked_units(modules: set[str] | list[str], deleted: set[str] | list[str]) -> tuple[list[str], list[str]]:
+    locked = load_deferred_locked_units()
+    preserved_orphans = load_preserved_orphan_units()
+    locked_gradle = {f":{u.replace('/', ':')}" for u in locked}
+    locked_pkgs = {u.removeprefix("src/").replace("/", ".") for u in locked} | preserved_orphans
+    return (
+        [m for m in modules if m not in locked_gradle],
+        [d for d in deleted if d not in locked_pkgs],
+    )
+
+
 def is_top_level_gradle_module_file(posix_path: str) -> bool:
     """Detect changes inside dynamic top-level Gradle module directories (e.g., extensions-lib/)."""
     top = posix_path.split("/", 1)[0]
@@ -171,7 +222,7 @@ def get_module_list(ref: str) -> tuple[list[str], list[str]]:
         modules.update(all_modules)
         deleted.update(all_deleted)
 
-        return list(modules), list(deleted)
+        return _filter_locked_units(modules, deleted)
 
     # Resolve libs that depend on the changed libs (recursively)
     libs.update(
@@ -188,7 +239,7 @@ def get_module_list(ref: str) -> tuple[list[str], list[str]]:
     modules.update([f":src:{lang}:{extension}" for lang, extension in extensions])
     deleted.update([f"{lang}.{extension}" for lang, extension in extensions])
 
-    return list(modules), list(deleted)
+    return _filter_locked_units(modules, deleted)
 
 def get_all_modules() -> tuple[list[str], list[str]]:
     modules = []
@@ -197,7 +248,7 @@ def get_all_modules() -> tuple[list[str], list[str]]:
         for extension in lang.iterdir():
             modules.append(f":src:{lang.name}:{extension.name}")
             deleted.append(f"{lang.name}.{extension.name}")
-    return modules, deleted
+    return _filter_locked_units(modules, deleted)
 
 def main() -> None:
     _, ref, build_type = sys.argv

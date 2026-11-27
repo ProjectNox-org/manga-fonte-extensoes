@@ -5,7 +5,7 @@ import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.model.SMangaUpdate
+import keiyoushi.source.SMangaUpdate
 import keiyoushi.annotation.Source
 import keiyoushi.network.Fetch
 import keiyoushi.network.get
@@ -77,7 +77,7 @@ abstract class TruyenHentaivn : KeiSource() {
         val manga = SManga.create().apply {
             setUrlWithoutDomain(detailUrl.toString())
         }
-        return fetchMangaUpdate(manga, emptyList(), true, false).manga
+        return fetchMangaUpdate(manga, emptyList(), true, false).manga()
     }
 
     private fun listPageUrl(path: String, page: Int): HttpUrl = "$baseUrl$path".toHttpUrl().newBuilder()

@@ -4,6 +4,7 @@ import eu.kanade.tachiyomi.multisrc.madara.Madara
 import eu.kanade.tachiyomi.source.model.Page
 import keiyoushi.annotation.Source
 import keiyoushi.network.rateLimit
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -24,8 +25,7 @@ abstract class HuntersScans : Madara() {
         readTimeout(1.minutes)
         addInterceptor { chain ->
             val response = chain.proceed(chain.request())
-            val firstSegment = response.request.url.pathSegments.firstOrNull { it.isNotEmpty() }
-            if (firstSegment.equals("logar", true) || firstSegment.equals("registrar", true)) {
+            if (response.request.url.pathSegments.any { segment -> listOf("logar", "registrar").any { it.equals(segment, true) } }) {
                 response.close()
                 throw IOException("Faça o login na WebView")
             }
@@ -60,9 +60,10 @@ abstract class HuntersScans : Madara() {
             }
         }
 
-        val canvasPages = document.select("canvas[data-page-url]").mapIndexed { index, el ->
-            val url = el.attr("abs:data-page-url").takeIf { it.isNotEmpty() }
-            Page(index, document.location(), url)
+        val canvasPages = document.select("canvas.protected-chapter-canvas[data-page-url], canvas[data-page-url]").mapIndexedNotNull { index, el ->
+            val rawUrl = el.absUrl("data-page-url").takeIf { it.isNotEmpty() } ?: return@mapIndexedNotNull null
+            val imageUrl = rawUrl.toHttpUrl().newBuilder().scheme("https").build().toString()
+            Page(index, document.location(), imageUrl)
         }
         if (canvasPages.isNotEmpty()) return canvasPages
 

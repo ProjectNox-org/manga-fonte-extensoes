@@ -8,7 +8,7 @@ import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.model.SMangaUpdate
+import keiyoushi.source.SMangaUpdate
 import keiyoushi.annotation.Source
 import keiyoushi.network.get
 import keiyoushi.network.rateLimit
@@ -100,7 +100,7 @@ abstract class GeassComics :
         val manga = SManga.create().apply { this.url = slug }
 
         return fetchMangaUpdate(manga, emptyList(), fetchDetails = true, fetchChapters = true)
-            .manga
+            .manga()
             .apply { initialized = true }
     }
 
