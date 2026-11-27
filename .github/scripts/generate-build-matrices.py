@@ -221,7 +221,7 @@ def get_module_list(ref: str) -> tuple[list[str], list[str]]:
     modules.update([f":src:{lang}:{extension}" for lang, extension in extensions])
     deleted.update([f"{lang}.{extension}" for lang, extension in extensions])
 
-    return _filter_locked_units(modules, deleted)
+    return list(modules), list(deleted)
 
 def get_all_modules() -> tuple[list[str], list[str]]:
     modules = []
