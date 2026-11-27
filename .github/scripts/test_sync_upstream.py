@@ -2965,6 +2965,54 @@ class SyncRecoveryRegressionTest(unittest.TestCase):
         )
         self.assertIn('theme = "zeistmanga"', gradle_in_tree)
 
+    def test_prove_protected_multisrc_updates_lagging_unprotected_dependent_matching_upstream_history(self):
+        self._write("gradlew", "#!/bin/sh\nexit 0\n")
+        Path(self.repo / "gradlew").chmod(0o755)
+        self._write(
+            "lib-multisrc/madara/build.gradle.kts",
+            'val libVersion = "1.6"\nval baseVersionCode = 1\n',
+        )
+        self._write("lib-multisrc/madara/src/Madara.kt", "// v1\n")
+        self._write(
+            "src/en/kensscan/build.gradle.kts",
+            'ext {\n    extName = "Kensscan"\n    theme = "madara"\n    libVersion = "1.6"\n    versionCode = 1\n}\n',
+        )
+        self._write("src/en/kensscan/src/Kensscan.kt", "// old upstream v1\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "v1")
+        v1 = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "-b", "upstream-madara3")
+        self._write(
+            "lib-multisrc/madara/build.gradle.kts",
+            'val libVersion = "1.6"\nval baseVersionCode = 2\n',
+        )
+        self._write(
+            "src/en/kensscan/build.gradle.kts",
+            'ext {\n    extName = "Kensscan"\n    theme = "madara"\n    libVersion = "1.6"\n    versionCode = 2\n}\n',
+        )
+        self._write("src/en/kensscan/src/Kensscan.kt", "// updated upstream v2\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "upstream v2")
+        v2 = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "main")
+        # Simulate prior -s ours merge where base == upstream (v2) while kensscan remained at v1
+        self.git("merge", "--no-ff", "-s", "ours", "-m", "deferred ours", v2)
+        sync_upstream.write_deferred_migrations({"madara": {"patch_base": v1, "upstream_ref": v2, "units": ["src/en/kensscan"]}})
+        self._write("lib-multisrc/madara/src/Madara.kt", "// v1\n// nox tweak\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "nox tweak")
+
+        accepted, deferred = sync_upstream.prove_protected_multisrc(v2, v2, [], set())
+        self.assertIn("madara", accepted)
+        self.assertNotIn("madara", deferred)
+        kensscan_in_tree = subprocess.check_output(
+            ["git", "show", f"{accepted['madara']['tree']}:src/en/kensscan/src/Kensscan.kt"],
+            text=True,
+        )
+        self.assertIn("updated upstream v2", kensscan_in_tree)
+
 
 if __name__ == "__main__":
     unittest.main()

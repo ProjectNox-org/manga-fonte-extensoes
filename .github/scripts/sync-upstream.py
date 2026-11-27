@@ -2231,7 +2231,9 @@ def prove_protected_multisrc(
                     target = structural_metadata(upstream_ref, dependent)
                     exists_in_sandbox = (sandbox / dependent / "build.gradle.kts").exists()
                     preserve = exists_in_sandbox and (
-                        dependent in protected_units or dependent in local_changed or target is None
+                        dependent in protected_units
+                        or (dependent in local_changed and not unit_matches_upstream_history(dependent, upstream_ref))
+                        or target is None
                     )
                     if preserve:
                         # If a protected/localized extension moved to another multisrc theme locally
