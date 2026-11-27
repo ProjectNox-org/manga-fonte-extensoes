@@ -29,18 +29,40 @@ class MirrorPreferences(
         }
     }
 
-    private val mirrors: List<Pair<String, String>>
-        get() = preferences.getString(fetchedKey, null)?.split(",")?.map { "" to it } ?: effectiveDefaultMirrors.asList()
+    /** The mirrors in use: the fetched urls if any, else the hardcoded ones. */
+    val mirrors: List<Pair<String, String>>
+        get() = preferences.getString(fetchedKey, null)
+            ?.takeIf { it.isNotBlank() }
+            ?.split(",")
+            ?.map { "" to it }
+            ?: effectiveDefaultMirrors.asList()
 
     private val index: Int
-        get() = (preferences.getString(prefKey, "0")?.toIntOrNull() ?: 0).coerceIn(0, mirrors.size - 1)
+        get() = (preferences.getString(prefKey, "0")?.toIntOrNull() ?: 0)
+            .coerceIn(0, (mirrors.size - 1).coerceAtLeast(0))
 
     val baseUrl: String
-        get() = mirrors[index].second
+        get() = mirrors.getOrNull(index)?.second.orEmpty()
 
     override fun update(urls: List<String>) {
-        // The default follows the site's order, a pick follows its url
-        val newIndex = if (index == 0) 0 else urls.indexOf(baseUrl).coerceAtLeast(0)
+        if (urls.isEmpty()) {
+            preferences.edit()
+                .remove(fetchedKey)
+                .remove(fetchedFromKey)
+                .putString(prefKey, "0")
+                .apply()
+            return
+        }
+        // The default follows the site's order. A pick follows its url, or keeps its place when its domain moved in a
+        // list of the same size, else goes back to the first mirror
+        val pick = index
+        val currentUrl = mirrors.getOrNull(pick)?.second
+        val newIndex = when {
+            pick == 0 -> 0
+            currentUrl != null && currentUrl in urls -> urls.indexOf(currentUrl)
+            urls.size == mirrors.size -> pick
+            else -> 0
+        }
         preferences.edit()
             .putString(fetchedKey, urls.joinToString(","))
             .putString(fetchedFromKey, hardcodedUrls)

@@ -5,94 +5,181 @@ import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
+import keiyoushi.network.fetch
 import keiyoushi.network.get
 import keiyoushi.network.post
+import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
+import keiyoushi.source.SMangaUpdate
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.stringOrNull
 import keiyoushi.utils.toJsonElement
 import keiyoushi.utils.toJsonRequestBody
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.JsonElement
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import java.io.IOException
+import java.text.Normalizer
 
 @Source
 abstract class NexusMangas : KeiSource() {
 
-    override suspend fun getPopularManga(page: Int): MangasPage {
-        val ranking = client.post(
-            "$API_URL/rpc/get_top_works_by_views",
-            apiHeaders,
-            TopWorksRequest(POPULAR_LIMIT).toJsonRequestBody(),
-        ).parseAs<List<RankingDto>>()
-        val pageItems = ranking.drop((page - 1) * PAGE_SIZE).take(PAGE_SIZE)
-        if (pageItems.isEmpty()) return MangasPage(emptyList(), false)
+    private val apiUrl = "https://$API_HOST/rest/v1"
 
-        val works = getWorks(
-            worksUrl().addQueryParameter("id", "in.(${pageItems.joinToString(",") { it.workId }})").build(),
-        ).associateBy(WorkDto::id)
-        return MangasPage(
-            pageItems.mapNotNull { works[it.workId]?.toSManga() },
-            ranking.size > page * PAGE_SIZE,
+    private val functionsUrl = "https://$API_HOST/functions/v1"
+
+    private val mediaUrl = "$functionsUrl/read-public-media".toHttpUrl()
+
+    private val pageInterceptor = Interceptor(::renewExpiredPage)
+
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = this
+        .addInterceptor(::authorizeApi)
+        .addInterceptor(pageInterceptor)
+        .rateLimit(3) { it.host == API_HOST && it.encodedPath != mediaUrl.encodedPath }
+
+    private val pageClient by lazy {
+        client.newBuilder()
+            .apply { interceptors().removeAll { it === pageInterceptor || it.javaClass.simpleName == "CloudflareInterceptor" } }
+            .build()
+    }
+
+    override fun Headers.Builder.configureHeaders(): Headers.Builder = this
+        .set("Accept", "application/json")
+
+    private val countHeaders: Headers
+        get() = headersBuilder()
+            .set("Prefer", "count=exact")
+            .build()
+
+    private val readerHeaders: Headers
+        get() = headersBuilder()
+            .set("x-nexus-client", "reader-v3")
+            .build()
+
+    private fun authorizeApi(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        if (request.url.host != API_HOST) return chain.proceed(request)
+
+        return chain.proceed(
+            request.newBuilder()
+                .header("apikey", ANON_KEY)
+                .header("Authorization", "Bearer $ANON_KEY")
+                .build(),
         )
     }
 
-    override suspend fun getLatestUpdates(page: Int): MangasPage {
-        val releasePages = mutableListOf<List<LatestReleaseDto>>()
-        repeat(page) { index -> releasePages += getLatestReleasePage(index) }
-        val workIds = releasePages.flatten().map(LatestReleaseDto::workId).distinct()
-        val pageIds = workIds.drop((page - 1) * PAGE_SIZE).take(PAGE_SIZE)
-        val works = getWorksByIds(pageIds).associateBy(WorkDto::id)
-        return MangasPage(
-            pageIds.mapNotNull { works[it]?.toSManga() },
-            releasePages.lastOrNull()?.size == LATEST_LIMIT,
-        )
+    private fun renewExpiredPage(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val fragment = request.url.fragment
+        if (fragment == null || request.url.host == API_HOST) return chain.proceed(request)
+
+        val response = pageClient.newCall(request.newBuilder().fetch(Fetch.IMAGE).build()).execute()
+        val index = fragment.substringAfter('/').toIntOrNull()
+        if (response.code != 403 || index == null) return response
+
+        response.close()
+        val readRequest = Request.Builder()
+            .url("$functionsUrl/read-chapter")
+            .headers(readerHeaders)
+            .post(ReadChapterRequestDto(fragment.substringBefore('/')).toJsonRequestBody())
+            .fetch(Fetch.XHR)
+            .build()
+        val pageUrl = client.newCall(readRequest).execute()
+            .parseAs<ReadChapterDto>()
+            .pageUrl(index)
+
+        return pageClient.newCall(request.newBuilder().url(pageUrl).fetch(Fetch.IMAGE).build()).execute()
     }
 
-    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
-        val genre = filters.firstInstanceOrNull<GenreFilter>()?.selectedValue
-        val format = filters.firstInstanceOrNull<FormatFilter>()?.selectedValue
-        val type = filters.firstInstanceOrNull<TypeFilter>()?.selectedValue
-        val rating = filters.firstInstanceOrNull<ContentRatingFilter>()?.selectedValue
-        val select = buildString {
-            append(WORK_LIST_SELECT)
-            if (genre != null) append(",work_genres!inner(genre_id)")
-            if (format != null) append(",work_formats!inner(format_id)")
-        }
-        val url = worksUrl(select)
-            .addQueryParameter("order", "title.asc")
+    override suspend fun getPopularManga(page: Int): MangasPage = fetchWorks(page, order = POPULAR_ORDER)
+
+    override suspend fun getLatestUpdates(page: Int): MangasPage = fetchWorks(page, order = LATEST_ORDER)
+
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage = fetchWorks(
+        page = page,
+        order = filters.firstInstanceOrNull<SortFilter>()?.selectedValue ?: POPULAR_ORDER,
+        search = query,
+        type = filters.firstInstanceOrNull<TypeFilter>()?.selectedValue,
+        status = filters.firstInstanceOrNull<StatusFilter>()?.selectedValue,
+        demographic = filters.firstInstanceOrNull<DemographicFilter>()?.selectedValue,
+        genre = filters.firstInstanceOrNull<GenreFilter>()?.selectedValue,
+    )
+
+    private suspend fun fetchWorks(
+        page: Int,
+        order: String,
+        search: String? = null,
+        type: String? = null,
+        status: String? = null,
+        demographic: String? = null,
+        genre: String? = null,
+    ): MangasPage {
+        val genreJoin = if (genre.isNullOrBlank()) "" else ",work_genres!inner(genres!inner(name))"
+
+        val url = "$apiUrl/works".toHttpUrl().newBuilder()
+            .addQueryParameter("select", "$LIST_COLUMNS$genreJoin")
+            .addQueryParameter("order", "$order,id.desc")
             .addQueryParameter("limit", PAGE_SIZE.toString())
             .addQueryParameter("offset", ((page - 1) * PAGE_SIZE).toString())
             .apply {
-                if (query.isNotBlank()) {
-                    addQueryParameter("or", "(title.ilike.*${query.trim()}*,alternative_title.ilike.*${query.trim()}*)")
+                search?.toSearchPattern()?.let {
+                    addQueryParameter("or", "(title.imatch.$it,alternative_title.imatch.$it)")
                 }
-                genre?.let {
-                    addQueryParameter("work_genres.genre_id", "eq.$it")
+                addQueryParameter("type", type?.takeIf(String::isNotBlank)?.let { "eq.$it" } ?: "neq.$NOVEL_TYPE")
+                status?.takeIf(String::isNotBlank)?.let { addQueryParameter("status", "eq.$it") }
+                demographic?.takeIf(String::isNotBlank)?.let { addQueryParameter("demographic", "eq.$it") }
+                genre?.takeIf(String::isNotBlank)?.let {
+                    addQueryParameter("work_genres.genres.name", "eq.$it")
                 }
-                format?.let {
-                    addQueryParameter("work_formats.format_id", "eq.$it")
-                }
-                type?.let { addQueryParameter("type", "eq.$it") }
-                rating?.let { addQueryParameter("content_rating", "eq.$it") }
             }
             .build()
-        val works = getWorks(url)
-        return MangasPage(works.map(WorkDto::toSManga), works.size == PAGE_SIZE)
+
+        val works = client.get(url, Fetch.XHR).parseAs<List<WorkDto>>()
+
+        return MangasPage(works.map { it.toSManga(mediaUrl) }, works.size == PAGE_SIZE)
+    }
+
+    private fun String.toSearchPattern(): String? {
+        val text = Normalizer.normalize(this, Normalizer.Form.NFC)
+            .lowercase()
+            .trim()
+            .replace(WHITESPACE_REGEX, " ")
+            .takeIf(String::isNotEmpty)
+            ?: return null
+
+        val pattern = text.map { char ->
+            val accentClass = ACCENT_CLASSES[Normalizer.normalize(char.toString(), Normalizer.Form.NFD).first()]
+            when {
+                char == ' ' -> "[[:space:]]+"
+                accentClass != null -> if (char in accentClass) accentClass else accentClass.dropLast(1) + char + "]"
+                char in REGEX_SPECIAL_CHARS -> "\\$char"
+                else -> char.toString()
+            }
+        }.joinToString("")
+
+        return buildString {
+            append('"')
+            append(pattern.replace("\\", "\\\\").replace("\"", "\\\""))
+            append('"')
+        }
     }
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
-        if (url.host != baseUrl.toHttpUrl().host || url.pathSegments.firstOrNull() != "obra") return null
+        val siteHost = baseUrl.toHttpUrl().host.removePrefix("www.")
+        if (url.host.removePrefix("www.") != siteHost || url.pathSegments.firstOrNull() != "obra") return null
         val slug = url.pathSegments.getOrNull(1)?.takeIf(String::isNotBlank) ?: return null
-        return getWorks(
-            worksUrl(WORK_DETAILS_SELECT).addQueryParameter("slug", "eq.$slug").build(),
-        ).firstOrNull()?.toSManga()
+        val manga = SManga.create().apply { this.url = slug }
+
+        return getMangaUpdate(manga, emptyList(), fetchDetails = true, fetchChapters = false).manga
+            .takeUnless { "Novel" in it.genre.orEmpty().split(", ") }
     }
 
     override suspend fun fetchMangaUpdate(
@@ -100,114 +187,142 @@ abstract class NexusMangas : KeiSource() {
         chapters: List<SChapter>,
         fetchDetails: Boolean,
         fetchChapters: Boolean,
-    ): SMangaUpdate = coroutineScope {
-        val slug = manga.url.substringAfterLast('/').takeIf(String::isNotBlank)
-            ?: throw Exception("URL da obra inválida. Abra a obra novamente.")
-        val work = async {
-            getWorks(worksUrl(WORK_DETAILS_SELECT).addQueryParameter("slug", "eq.$slug").build()).firstOrNull()
-                ?: throw Exception("Obra não encontrada no Nexus Mangas.")
-        }
-        val details = if (fetchDetails) async { work.await().toSManga() } else null
-        val chapterList = if (fetchChapters) async { getChapters(work.await().id, slug) } else null
-        SMangaUpdate(details?.await() ?: manga, chapterList?.await() ?: chapters)
-    }
-
-    override fun getMangaUrl(manga: SManga) = "$baseUrl${manga.url}"
-
-    override fun getChapterUrl(chapter: SChapter) = "$baseUrl${chapter.url.substringBefore('#')}"
-
-    override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val id = chapter.memo["id"]?.stringOrNull
-            ?: chapter.url.substringAfter('#', "").takeIf { it.isNotBlank() }
-            ?: throw Exception("Atualize a lista de capítulos para abrir este capítulo.")
-        val response = client.post(
-            "$FUNCTIONS_URL/read-chapter",
-            apiHeaders,
-            ReadChapterRequest(id).toJsonRequestBody(),
-        ).parseAs<ReadChapterResponse>()
-        val pages = response.chapter?.pages.orEmpty()
-        require(response.access?.allowed != false && pages.isNotEmpty()) {
-            "Este capítulo não está disponível gratuitamente no Nexus Mangas."
-        }
-        return pages.mapIndexed { index, image -> Page(index, imageUrl = image.toCdnUrl()) }
-    }
-
-    override val supportsFilterFetching = true
-
-    override suspend fun fetchFilterData(): JsonElement = coroutineScope {
-        val genres = async { getFilterOptions("genres") }
-        val formats = async { getFilterOptions("formats") }
-        FilterData(genres.await(), formats.await()).toJsonElement()
-    }
-
-    override fun getFilterList(data: JsonElement?): FilterList {
-        val filterData = data?.parseAs<FilterData>() ?: return FilterList()
-        return FilterList(
-            TypeFilter(),
-            ContentRatingFilter(),
-            GenreFilter(filterData.genres),
-            FormatFilter(filterData.formats),
+    ): SMangaUpdate {
+        val slug = normalizeSlug(manga.url)
+        return SMangaUpdate(
+            manga = if (fetchDetails) fetchWork(slug) else manga,
+            chapters = if (fetchChapters) fetchChapters(slug) else chapters,
         )
     }
 
-    private suspend fun getWorks(url: HttpUrl): List<WorkDto> = client.get(url.toString(), apiHeaders).parseAs()
+    private fun normalizeSlug(mangaUrl: String): String = mangaUrl
+        .removePrefix("/obra/")
+        .substringBefore('#')
+        .trimEnd('/')
+        .substringAfterLast('/')
 
-    private suspend fun getWorksByIds(ids: List<String>): List<WorkDto> = ids.chunked(WORKS_REQUEST_LIMIT).flatMap { chunk ->
-        getWorks(worksUrl().addQueryParameter("id", "in.(${chunk.joinToString(",")})").build())
-    }
-
-    private suspend fun getLatestReleasePage(index: Int): List<LatestReleaseDto> = client.get(
-        "$API_URL/chapters".toHttpUrl().newBuilder()
-            .addQueryParameter("select", "work_id,created_at")
-            .addQueryParameter("order", "created_at.desc")
-            .addQueryParameter("limit", LATEST_LIMIT.toString())
-            .addQueryParameter("offset", (index * LATEST_LIMIT).toString())
-            .build().toString(),
-        apiHeaders,
-    ).parseAs()
-
-    private fun worksUrl(select: String = WORK_LIST_SELECT) = "$API_URL/works".toHttpUrl().newBuilder()
-        .addQueryParameter("select", select)
-
-    private suspend fun getChapters(workId: String, slug: String): List<SChapter> = client.get(
-        "$API_URL/chapters".toHttpUrl().newBuilder()
-            .addQueryParameter("select", "id,number,title,created_at,scan:scans(name)")
-            .addQueryParameter("work_id", "eq.$workId")
-            .addQueryParameter("order", "number.desc")
-            .addQueryParameter("limit", MAX_CHAPTERS.toString())
-            .build().toString(),
-        apiHeaders,
-    ).parseAs<List<ChapterDto>>()
-        .map { it.toSChapter(slug) }
-
-    private suspend fun getFilterOptions(table: String): List<FilterOptionDto> = client.get(
-        "$API_URL/$table".toHttpUrl().newBuilder()
-            .addQueryParameter("select", "id,name")
-            .addQueryParameter("order", "name.asc")
-            .build().toString(),
-        apiHeaders,
-    ).parseAs()
-
-    private val apiHeaders: Headers
-        get() = headers.newBuilder()
-            .set("apikey", ANON_KEY)
-            .set("Authorization", "Bearer $ANON_KEY")
-            .set("Accept", "application/json")
-            .set("Origin", baseUrl)
-            .set("Referer", "$baseUrl/")
+    private suspend fun fetchWork(slug: String): SManga {
+        val url = "$apiUrl/works".toHttpUrl().newBuilder()
+            .addQueryParameter("select", DETAIL_COLUMNS)
+            .addQueryParameter("slug", "eq.$slug")
+            .addQueryParameter("limit", "1")
             .build()
 
-    private companion object {
-        const val SUPABASE_URL = "https://supabase.nexusmangas.com"
-        const val API_URL = "$SUPABASE_URL/rest/v1"
-        const val FUNCTIONS_URL = "$SUPABASE_URL/functions/v1"
-        const val PAGE_SIZE = 24
-        const val LATEST_LIMIT = 900
-        const val POPULAR_LIMIT = 120
-        const val MAX_CHAPTERS = 1000
-        const val WORKS_REQUEST_LIMIT = 240
-        const val WORK_LIST_SELECT = "id,title,slug,cover_url,status,type,content_rating"
-        const val WORK_DETAILS_SELECT = "id,title,slug,cover_url,description,alternative_title,status,type,content_rating,release_year,author,artist,work_genres(genre:genres(name)),work_formats(format:formats(name)),scan:scans(name)"
-        const val ANON_KEY = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJzdXBhYmFzZSIsImlhdCI6MTc4NzgwMjAwMCwiZXhwIjo0OTQzNDc1NjAwLCJyb2xlIjoiYW5vbiJ9.Cnl8Jw2DeKe84OAkmJYfO33xlcZsw0TC2Nw_il0tpRs"
+        val work = client.get(url, Fetch.XHR).parseAs<List<WorkDto>>().firstOrNull()
+            ?: throw IOException("Obra não encontrada")
+
+        return work.toSManga(mediaUrl)
+    }
+
+    private suspend fun fetchChapters(slug: String): List<SChapter> {
+        val chapters = mutableListOf<ChapterDto>()
+        var total: Int
+        do {
+            val url = "$apiUrl/chapters".toHttpUrl().newBuilder()
+                .addQueryParameter("select", "$CHAPTER_COLUMNS,works!work_id!inner()")
+                .addQueryParameter("works.slug", "eq.$slug")
+                .addQueryParameter("order", "sort_order.desc,id.desc")
+                .addQueryParameter("limit", CHAPTER_PAGE_SIZE.toString())
+                .addQueryParameter("offset", chapters.size.toString())
+                .build()
+
+            val response = client.get(url, countHeaders, Fetch.XHR)
+            val page = response.parseAs<List<ChapterDto>>()
+            total = response.header("Content-Range")!!.substringAfter('/').toInt()
+            chapters += page
+        } while (page.isNotEmpty() && chapters.size < total)
+
+        return chapters.map { it.toSChapter(slug) }
+    }
+
+    override fun getMangaUrl(manga: SManga): String = "$baseUrl/obra/${normalizeSlug(manga.url)}"
+
+    override fun getChapterUrl(chapter: SChapter): String {
+        val path = chapter.url.substringBefore('#')
+        return if (path.startsWith("http")) path else "$baseUrl${if (path.startsWith('/')) path else "/$path"}"
+    }
+
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val cleanUrl = chapter.url.substringBefore('#')
+        val chapterId = chapter.memo["id"]?.stringOrNull
+            ?: chapter.url.substringAfter('#', "").takeIf(String::isNotBlank)
+            ?: if (cleanUrl.startsWith(READ_PATH)) cleanUrl.removePrefix(READ_PATH) else findChapterId(cleanUrl)
+
+        return client.post("$functionsUrl/read-chapter", readerHeaders, Fetch.XHR, ReadChapterRequestDto(chapterId).toJsonRequestBody())
+            .parseAs<ReadChapterDto>()
+            .toPageList(chapterId)
+    }
+
+    private suspend fun findChapterId(chapterUrl: String): String {
+        val (slug, number) = chapterUrl.split('/').takeLast(2)
+
+        val url = "$apiUrl/chapters".toHttpUrl().newBuilder()
+            .addQueryParameter("select", "id,works!work_id!inner()")
+            .addQueryParameter("works.slug", "eq.$slug")
+            .addQueryParameter("number", "eq.$number")
+            .addQueryParameter("limit", "1")
+            .build()
+
+        return client.get(url, Fetch.XHR).parseAs<List<ChapterIdDto>>().firstOrNull()?.id
+            ?: throw IOException("Capítulo não encontrado")
+    }
+
+    override val supportsFilterFetching: Boolean get() = true
+
+    override suspend fun fetchFilterData(): JsonElement {
+        val url = "$apiUrl/genres".toHttpUrl().newBuilder()
+            .addQueryParameter("select", "name")
+            .addQueryParameter("order", "name.asc")
+            .addQueryParameter("limit", "200")
+            .build()
+
+        val genres = client.get(url, Fetch.XHR).parseAs<List<GenreDto>>().map(GenreDto::name)
+
+        return FilterData(genres).toJsonElement()
+    }
+
+    override fun getFilterList(data: JsonElement?): FilterList {
+        val genres = data?.parseAs<FilterData>()?.genres
+
+        return FilterList(
+            listOfNotNull(
+                SortFilter(),
+                TypeFilter(),
+                StatusFilter(),
+                DemographicFilter(),
+                genres?.takeIf(List<String>::isNotEmpty)?.let(::GenreFilter),
+            ),
+        )
+    }
+
+    companion object {
+        private const val API_HOST = "supabase.nexusmangas.com"
+        const val READ_PATH = "/read/"
+        private const val PAGE_SIZE = 30
+        private const val NOVEL_TYPE = "NOVEL"
+        private const val POPULAR_ORDER = "avg_rating.desc.nullslast"
+        private const val LATEST_ORDER = "updated_at.desc"
+        private const val LIST_COLUMNS = "slug,title,cover_url,status,type"
+        private const val DETAIL_COLUMNS =
+            "slug,title,description,cover_url,alternative_title,status,type,author,artist," +
+                "demographic,scan:scans(name),work_genres(genres(name))"
+        private const val CHAPTER_COLUMNS = "id,number,chapter_label,title,published_at"
+        private const val CHAPTER_PAGE_SIZE = 1000
+        private const val ANON_KEY =
+            "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9." +
+                "eyJpc3MiOiJzdXBhYmFzZSIsImlhdCI6MTc4NzgwMjAwMCwiZXhwIjo0OTQzNDc1NjAwLCJyb2xlIjoiYW5vbiJ9." +
+                "Cnl8Jw2DeKe84OAkmJYfO33xlcZsw0TC2Nw_il0tpRs"
+        private val WHITESPACE_REGEX = Regex("""\s+""")
+        private const val REGEX_SPECIAL_CHARS = ".*+?^\${}()|[]\\"
+        private val ACCENT_CLASSES = mapOf(
+            'a' to "[aàáâãäå]",
+            'e' to "[eèéêë]",
+            'i' to "[iìíîï]",
+            'o' to "[oòóôõö]",
+            'u' to "[uùúûü]",
+            'c' to "[cç]",
+            'n' to "[nñ]",
+            'y' to "[yýÿ]",
+        )
     }
 }

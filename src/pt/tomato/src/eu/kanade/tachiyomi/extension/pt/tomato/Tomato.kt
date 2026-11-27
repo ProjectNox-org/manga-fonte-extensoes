@@ -16,12 +16,12 @@ import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
+import keiyoushi.source.SMangaUpdate
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonElement
@@ -190,7 +190,7 @@ abstract class Tomato :
         val result = client.post(SEARCH_URL, apiHeaders(token), SearchRequestDto(token, query.trim(), page - 1, tags).toJsonRequestBody()).parseAs<SearchResponseDto>().result.filter { it.type == "manga" }
         return MangasPage(result.map(SearchMangaDto::toSManga), result.size >= 50)
     }
-    override suspend fun getMangaByUrl(url: okhttp3.HttpUrl): SManga? = url.pathSegments.takeIf { it.size == 3 && it[0] == "v2" && it[1] == "manga" }?.getOrNull(2)?.toLongOrNull()?.let { id -> fetchMangaUpdate(SManga.create().apply { this.url = mangaUrl(id) }, emptyList(), true, false).manga }
+    override suspend fun getMangaByUrl(url: okhttp3.HttpUrl): SManga? = url.pathSegments.takeIf { it.size == 3 && it[0] == "v2" && it[1] == "manga" }?.getOrNull(2)?.toLongOrNull()?.let { id -> fetchMangaUpdate(SManga.create().apply { this.url = mangaUrl(id) }, emptyList(), true, false).manga() }
     override suspend fun fetchMangaUpdate(manga: SManga, chapters: List<SChapter>, fetchDetails: Boolean, fetchChapters: Boolean): SMangaUpdate {
         if (manga.url == LOGIN_REQUIRED_URL) return SMangaUpdate(manga, emptyList())
         val id = manga.url.substringAfterLast('/').toLongOrNull() ?: error("ID de mangá Tomato inválido")

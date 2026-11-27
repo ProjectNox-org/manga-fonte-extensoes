@@ -9,20 +9,16 @@ open class SelectFilter(name: String, private val options: List<Pair<String, Str
 class SortFilter :
     SelectFilter(
         "Ordenar por",
-        listOf(
-            "Mais recentes" to "latest",
-            "Novidades" to "new-manga",
-            "A–Z" to "alphabet",
-        ),
+        listOf("Mais recentes" to "latest", "Novidades" to "new-manga", "A–Z" to "alphabet"),
     )
 
 class StatusFilter :
     SelectFilter(
         "Status",
         listOf(
-            "Todos" to "",
-            "Em andamento" to "on-going",
-            "Concluído" to "completed",
+            "Todas" to "",
+            "Em Andamento" to "on-going",
+            "Concluídas" to "completed",
             "Projetos 3X" to "xxx",
             "Animações" to "animacoes",
         ),

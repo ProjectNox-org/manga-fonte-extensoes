@@ -6,7 +6,7 @@ import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.model.SMangaUpdate
+import keiyoushi.source.SMangaUpdate
 import eu.kanade.tachiyomi.source.model.UpdateStrategy
 import keiyoushi.annotation.Source
 import keiyoushi.network.get
@@ -123,7 +123,7 @@ abstract class HentaiHome : KeiSource() {
 
         val manga = SManga.create().apply { this.url = "/$slug/" }
         return fetchMangaUpdate(manga, emptyList(), fetchDetails = true, fetchChapters = false)
-            .manga
+            .manga()
             .apply { initialized = true }
     }
 

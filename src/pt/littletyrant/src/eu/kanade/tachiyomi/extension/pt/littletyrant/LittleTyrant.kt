@@ -62,7 +62,7 @@ abstract class LittleTyrant : Madara() {
     override fun archiveSelector() = ".card-hunters, .manga-hover-card, [id*=-entry-], div.page-item-detail, .manga__item, .c-tabs-item__content"
 
     override val archiveUrlSelector =
-        ".x7q-title a, .card-title a, .post-title a, a[href*='/manga/']"
+        ".card-info a, .x7q-title a, .card-title a, .post-title a, a[href*='/manga/']"
 
     override val archiveTitleSelector =
         ".x7q-title a, .card-title a, .post-title a, h4 a, h3"

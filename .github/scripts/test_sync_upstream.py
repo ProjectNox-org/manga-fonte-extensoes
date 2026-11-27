@@ -2685,5 +2685,155 @@ class VersionCatalogAndLintProtectionTest(unittest.TestCase):
         self.assertEqual(sync_upstream.get_code_sha("HEAD"), code_sha)
 
 
+class SyncRecoveryRegressionTest(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory(prefix="sync-recovery-test-")
+        self.repo = Path(self.tmpdir.name)
+        self.prev = Path.cwd()
+        os.chdir(self.repo)
+
+        def git(*args):
+            res = subprocess.run(["git", *args], cwd=self.repo, capture_output=True, text=True)
+            if res.returncode != 0:
+                raise RuntimeError(f"git {' '.join(args)} failed: {res.stderr}")
+            return res.stdout.strip()
+
+        self.git = git
+        self.git("init", "-b", "main")
+        self.git("config", "user.name", "Nox Recovery")
+        self.git("config", "user.email", "recovery@project-nox.test")
+
+    def tearDown(self):
+        os.chdir(self.prev)
+        self.tmpdir.cleanup()
+
+    def _write(self, rel_path: str, content: str) -> None:
+        p = self.repo / rel_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+
+    def test_unrelated_upstream_commit_deduplicates_without_rebuilding_or_committing(self):
+        self._write("core/src/main/kotlin/keiyoushi/source/MirrorPreferences.kt", "private val mirrors: List<Pair<String, String>> = emptyList()\n")
+        self._write("src/en/foo/Foo.kt", "package foo\n// v1\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "initial")
+        u1 = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "-b", "upstream-sim")
+        self._write("src/en/foo/Foo.kt", "package foo\n// v2\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "unrelated upstream extension edit")
+        u2 = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "main")
+        self.git("update-ref", "refs/remotes/origin/main", self.git("rev-parse", "HEAD"))
+        self.git("update-ref", "refs/remotes/upstream/main", u2)
+
+        self.assertFalse(sync_upstream.upstream_changes_affect_units(u1, u2, ["core"]))
+
+        code_sha = sync_upstream.get_code_sha("HEAD")
+        cause = "MirrorPreferencesTest.kt:63:52 private mirrors"
+        err_sig = sync_upstream.compute_error_signature(code_sha, "BLOCKED_STRUCTURAL", ["core"], cause)
+        sync_upstream.write_failure_signatures({
+            "error_signature": err_sig,
+            "local_head": self.git("rev-parse", "HEAD"),
+            "code_sha": code_sha,
+            "upstream_head": u1,
+            "state": "BLOCKED_STRUCTURAL",
+            "failed_units": ["core"],
+            "cause": cause,
+            "skip_count": 0,
+        })
+        head_before = self.git("rev-parse", "HEAD")
+        orig_git = sync_upstream.git
+
+        def fake_git(*args, **kw):
+            if args[:1] == ("fetch",):
+                return ""
+            return orig_git(*args, **kw)
+
+        with patch("sys.argv", ["sync-upstream.py", "--dry-run"]):
+            with patch.object(sync_upstream, "ensure_clean_tree"), \
+                 patch.object(sync_upstream, "ensure_upstream_remote"), \
+                 patch.object(sync_upstream, "apply_units") as mock_apply, \
+                 patch.object(sync_upstream, "git", side_effect=fake_git):
+                sync_upstream.main()
+                mock_apply.assert_not_called()
+
+        self.assertEqual(self.git("rev-parse", "HEAD"), head_before)
+        self.assertEqual(sync_upstream.load_failure_signatures()["skip_count"], 1)
+
+    def test_same_error_signature_does_not_create_duplicate_skip_ci_commit(self):
+        self._write("core/Dummy.kt", "class Dummy\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "base")
+        u1 = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "-b", "upstream-core")
+        self._write("core/Dummy.kt", "class Dummy { val x = 1 }\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "upstream core touch")
+        u2 = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "main")
+        code_sha = sync_upstream.get_code_sha("HEAD")
+        cause = "deterministic core failure"
+        err_sig = sync_upstream.compute_error_signature(code_sha, "BLOCKED_STRUCTURAL", ["core"], cause)
+        sync_upstream.write_failure_signatures({
+            "error_signature": err_sig,
+            "local_head": self.git("rev-parse", "HEAD"),
+            "code_sha": code_sha,
+            "upstream_head": u1,
+            "state": "BLOCKED_STRUCTURAL",
+            "failed_units": ["core"],
+            "cause": cause,
+            "skip_count": 2,
+        })
+        self.git("add", ".")
+        self.git("commit", "-m", "[skip ci] chore: record deterministic sync failure block")
+        self.git("update-ref", "refs/remotes/origin/main", self.git("rev-parse", "HEAD"))
+        self.git("update-ref", "refs/remotes/upstream/main", u2)
+        commit_count_before = int(self.git("rev-list", "--count", "HEAD"))
+
+        err = sync_upstream.StructuralIncompatibilityError(cause, failed_units=["core"])
+        orig_git = sync_upstream.git
+
+        def fake_git(*args, **kw):
+            if args[:1] in {("fetch",), ("push",)}:
+                return ""
+            return orig_git(*args, **kw)
+
+        with patch("sys.argv", ["sync-upstream.py", "--push"]), \
+             patch.object(sync_upstream, "ensure_clean_tree"), \
+             patch.object(sync_upstream, "ensure_upstream_remote"), \
+             patch.object(sync_upstream, "apply_units", side_effect=err), \
+             patch.object(sync_upstream, "git", side_effect=fake_git):
+            with self.assertRaises(SystemExit) as cm:
+                sync_upstream.main()
+            self.assertEqual(cm.exception.code, 1)
+
+        self.assertEqual(int(self.git("rev-list", "--count", "HEAD")), commit_count_before)
+        self.assertEqual(sync_upstream.load_failure_signatures()["skip_count"], 3)
+
+    def test_ensure_core_compatibility_restores_mirror_visibility_and_okhttp_shims(self):
+        self._write(
+            "core/src/main/kotlin/keiyoushi/source/MirrorPreferences.kt",
+            "class MirrorPreferences(\n    private val preferences: SharedPreferences,\n    defaultMirrors: Array<Pair<String, String>>,\n    private val title: String,\n) : FetchableBaseUrl {\n    private val hardcodedUrls = defaultMirrors.joinToString(\",\") { it.second }\n    private val mirrors: List<Pair<String, String>>\n        get() = defaultMirrors.asList()\n}\n",
+        )
+        self._write(
+            "core/src/main/kotlin/keiyoushi/network/OkHttp.kt",
+            "package keiyoushi.network\nfun head() = Unit\n",
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "core overwrite")
+        sync_upstream.ensure_core_compatibility()
+        mirror_text = (self.repo / "core/src/main/kotlin/keiyoushi/source/MirrorPreferences.kt").read_text()
+        okhttp_text = (self.repo / "core/src/main/kotlin/keiyoushi/network/OkHttp.kt").read_text()
+        self.assertIn("val mirrors: List<Pair<String, String>>", mirror_text)
+        self.assertNotIn("private val mirrors: List<Pair<String, String>>", mirror_text)
+        self.assertIn("mirrors: Array<Pair<String, String>> = defaultMirrors", mirror_text)
+        self.assertIn("Backwards compatibility for Nox extensions", okhttp_text)
+
+
 if __name__ == "__main__":
     unittest.main()

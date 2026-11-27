@@ -1,158 +1,128 @@
 package eu.kanade.tachiyomi.extension.pt.nexusmangas
 
-import eu.kanade.tachiyomi.source.model.Filter
+import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
+import keiyoushi.utils.MarkdownDescription
+import keiyoushi.utils.tryParse
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
-import java.time.Instant
+import okhttp3.HttpUrl
+import java.io.IOException
+import kotlin.time.Instant
 
 @Serializable
-internal class TopWorksRequest(@SerialName("p_limit") val limit: Int)
-
-@Serializable
-internal class RankingDto(@SerialName("work_id") val workId: String)
-
-@Serializable
-internal class LatestReleaseDto(
-    @SerialName("work_id") val workId: String,
-)
-
-@Serializable
-internal class WorkDto(
-    val id: String,
-    val title: String,
-    val slug: String,
-    @SerialName("cover_url") val coverUrl: String? = null,
-    val description: String? = null,
-    @SerialName("alternative_title") val alternativeTitle: String? = null,
-    val status: String? = null,
-    val type: String? = null,
-    @SerialName("content_rating") val contentRating: String? = null,
-    @SerialName("release_year") val releaseYear: Int? = null,
-    val author: String? = null,
-    val artist: String? = null,
-    @SerialName("work_genres") val workGenres: List<WorkGenreDto> = emptyList(),
-    @SerialName("work_formats") val workFormats: List<WorkFormatDto> = emptyList(),
-    val scan: ScanDto? = null,
+class WorkDto(
+    private val slug: String,
+    private val title: String,
+    private val description: String?,
+    @SerialName("cover_url") private val coverUrl: String?,
+    @SerialName("alternative_title") private val alternativeTitle: String?,
+    private val status: String?,
+    private val type: String?,
+    private val author: String?,
+    private val artist: String?,
+    private val demographic: String?,
+    private val scan: ScanDto?,
+    @SerialName("work_genres") private val workGenres: List<WorkGenreDto> = emptyList(),
 ) {
-    fun toSManga() = SManga.create().apply {
-        url = "/obra/$slug"
+    fun toSManga(mediaUrl: HttpUrl) = SManga.create().apply {
+        url = slug
         title = this@WorkDto.title
-        thumbnail_url = coverUrl?.takeIf(String::isNotBlank)?.toCdnUrl()
-        description = listOfNotNull(
-            description?.takeIf(String::isNotBlank),
-            alternativeTitle?.takeIf(String::isNotBlank)?.let { "Título alternativo: $it" },
-            releaseYear?.let { "Lançamento: $it" },
-            type?.takeIf(String::isNotBlank)?.let { "Tipo: $it" },
-            scan?.name?.takeIf(String::isNotBlank)?.let { "Scan: $it" },
-        ).joinToString("\n\n").ifBlank { null }
-        author = this@WorkDto.author
-        artist = this@WorkDto.artist
-        genre = (workGenres.mapNotNull { it.genre?.name } + workFormats.mapNotNull { it.format?.name }).joinToString(", ")
-            .ifBlank { null }
+        thumbnail_url = coverUrl?.takeIf(String::isNotBlank)?.let {
+            mediaUrl.newBuilder().addQueryParameter("key", it).build().toString()
+        }
+        author = this@WorkDto.author?.takeIf(String::isNotBlank)
+        artist = this@WorkDto.artist?.takeIf(String::isNotBlank)
+        description = MarkdownDescription.Builder()
+            .description(this@WorkDto.description)
+            .altTitles(listOfNotNull(alternativeTitle), "Título alternativo")
+            .field("Scan", scan?.name)
+            .build()
+        genre = buildList {
+            type?.let(::add)
+            demographic?.takeIf { it != "NONE" }?.let(::add)
+            workGenres.mapNotNullTo(this) { it.genres?.name }
+        }.map(::humanize).distinct().joinToString()
         status = when (this@WorkDto.status) {
-            "ONGOING", "EM_ANDAMENTO" -> SManga.ONGOING
-            "COMPLETED", "CONCLUÍDO", "CONCLUIDO" -> SManga.COMPLETED
-            "HIATUS", "ON_HIATUS", "HIATO" -> SManga.ON_HIATUS
-            "CANCELLED", "CANCELED", "CANCELADO" -> SManga.CANCELLED
+            "RELEASING" -> SManga.ONGOING
+            "COMPLETED" -> SManga.COMPLETED
+            "HIATUS" -> SManga.ON_HIATUS
+            "CANCELLED" -> SManga.CANCELLED
             else -> SManga.UNKNOWN
         }
     }
 }
 
 @Serializable
-internal class WorkGenreDto(val genre: EmbeddedTagDto? = null)
+class ScanDto(
+    val name: String?,
+)
 
 @Serializable
-internal class WorkFormatDto(val format: EmbeddedTagDto? = null)
+class WorkGenreDto(
+    val genres: GenreDto?,
+)
 
 @Serializable
-internal class EmbeddedTagDto(val name: String? = null)
+class GenreDto(
+    val name: String,
+)
 
 @Serializable
-internal class ScanDto(val name: String? = null)
-
-@Serializable
-internal class ChapterDto(
-    val id: String,
-    val number: Float? = null,
-    val title: String? = null,
-    @SerialName("created_at") val createdAt: String? = null,
-    val scan: ScanDto? = null,
+class ChapterDto(
+    private val id: String,
+    private val number: Float?,
+    @SerialName("chapter_label") private val label: String?,
+    private val title: String?,
+    @SerialName("published_at") private val publishedAt: String?,
 ) {
-    fun toSChapter(slug: String) = SChapter.create().apply {
-        val numberText = number?.display() ?: ""
-        url = "/capitulo/$slug/$numberText#$id"
-        name = title?.takeIf(String::isNotBlank) ?: "Capítulo $numberText".trim()
-        chapter_number = number ?: -1F
-        date_upload = createdAt?.let { runCatching { Instant.parse(it).toEpochMilli() }.getOrNull() } ?: 0L
-        scanlator = scan?.name?.takeIf(String::isNotBlank)
-        memo = buildJsonObject { put("id", id) }
+    fun toSChapter(workSlug: String) = SChapter.create().apply {
+        val numberLabel = number?.toString()?.removeSuffix(".0")
+        url = if (numberLabel != null) "/capitulo/$workSlug/$numberLabel" else "${NexusMangas.READ_PATH}$id"
+        name = buildString {
+            append(numberLabel?.let { "Capítulo $it" } ?: label!!)
+            this@ChapterDto.title?.takeIf(String::isNotBlank)?.let { append(" - $it") }
+        }
+        number?.let { chapter_number = it }
+        date_upload = Instant.tryParse(publishedAt)
     }
 }
 
 @Serializable
-internal class ReadChapterRequest(val chapterId: String)
-
-@Serializable
-internal class ReadChapterResponse(
-    val access: ReadChapterAccessDto? = null,
-    val chapter: ReaderChapterDto? = null,
+class ChapterIdDto(
+    val id: String,
 )
 
 @Serializable
-internal class ReadChapterAccessDto(val allowed: Boolean = false)
-
-@Serializable
-internal class ReaderChapterDto(val pages: List<String> = emptyList())
-
-internal fun String.toCdnUrl(): String = if (startsWith("http")) this else "$CDN_URL/${removePrefix("/")}"
-
-private const val CDN_URL = "https://assets.nexusmangas.com"
-
-@Serializable
-internal class FilterOptionDto(val id: String, val name: String)
-
-@Serializable
-internal class FilterData(
-    val genres: List<FilterOptionDto>,
-    val formats: List<FilterOptionDto>,
+class ReadChapterRequestDto(
+    private val chapterId: String,
 )
 
-internal class TypeFilter : Filter.Select<String>("Tipo", TYPE_OPTIONS.map { it.first }.toTypedArray()) {
-    val selectedValue get() = TYPE_OPTIONS[state].second.takeIf(String::isNotEmpty)
+@Serializable
+class ReadChapterDto(
+    private val access: AccessDto,
+    private val chapter: ReadChapterPagesDto?,
+) {
+    private val pages get() = chapter?.pages.orEmpty()
+
+    fun toPageList(chapterId: String): List<Page> {
+        if (!access.allowed) return emptyList()
+        return pages.mapIndexed { index, url -> Page(index, imageUrl = "$url#$chapterId/$index") }
+    }
+
+    fun pageUrl(index: Int): String = pages.getOrNull(index) ?: throw IOException("Página não encontrada")
 }
 
-internal class ContentRatingFilter : Filter.Select<String>("Classificação", CONTENT_RATING_OPTIONS.map { it.first }.toTypedArray()) {
-    val selectedValue get() = CONTENT_RATING_OPTIONS[state].second.takeIf(String::isNotEmpty)
-}
-
-internal class GenreFilter(private val options: List<FilterOptionDto>) : Filter.Select<String>("Gênero", options.toOptionArray()) {
-    val selectedValue get() = options.getOrNull(state - 1)?.id
-}
-
-internal class FormatFilter(private val options: List<FilterOptionDto>) : Filter.Select<String>("Formato", options.toOptionArray()) {
-    val selectedValue get() = options.getOrNull(state - 1)?.id
-}
-
-private fun List<FilterOptionDto>.toOptionArray() = arrayOf("Todos") + map(FilterOptionDto::name)
-
-private fun Float.display() = toString().removeSuffix(".0")
-
-private val TYPE_OPTIONS = listOf(
-    "Todos" to "",
-    "Mangá" to "MANGA",
-    "Manhwa" to "MANHWA",
-    "Manhua" to "MANHUA",
-    "Novel" to "NOVEL",
+@Serializable
+class AccessDto(
+    val allowed: Boolean,
 )
 
-private val CONTENT_RATING_OPTIONS = listOf(
-    "Todas" to "",
-    "Safe" to "SAFE",
-    "Sugestivo" to "SUGGESTIVE",
-    "+18" to "ADULT",
+@Serializable
+class ReadChapterPagesDto(
+    val pages: List<String> = emptyList(),
 )
+
+private fun humanize(value: String): String = value.split('_')
+    .joinToString(" ") { word -> word.lowercase().replaceFirstChar(Char::uppercase) }
