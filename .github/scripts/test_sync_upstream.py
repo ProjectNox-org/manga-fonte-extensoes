@@ -3013,6 +3013,37 @@ class SyncRecoveryRegressionTest(unittest.TestCase):
         )
         self.assertIn("updated upstream v2", kensscan_in_tree)
 
+    def test_prove_protected_multisrc_skips_spotless_tasks_only_for_gradle_repo_layout(self):
+        self._write(
+            "gradlew",
+            "#!/usr/bin/env python3\nimport sys\nassert '-x' in sys.argv and 'spotlessApply' in sys.argv\n",
+        )
+        Path(self.repo / "gradlew").chmod(0o755)
+        self._write("gradle/libs.versions.toml", "# gradle dir marker\n")
+        self._write("lib-multisrc/madara/build.gradle.kts", 'val libVersion = "1.6"\nval baseVersionCode = 1\n')
+        self._write("lib-multisrc/madara/src/Madara.kt", "// base\n")
+        self._write(
+            "src/pt/sample/build.gradle.kts",
+            'ext {\n    theme = "madara"\n    libVersion = "1.6"\n    versionCode = 1\n}\n',
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "base")
+        base_sha = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "-b", "upstream-spotless")
+        self._write("lib-multisrc/madara/build.gradle.kts", 'val libVersion = "1.6"\nval baseVersionCode = 2\n')
+        self.git("add", ".")
+        self.git("commit", "-m", "upstream madara")
+
+        self.git("checkout", "main")
+        self._write("lib-multisrc/madara/src/Madara.kt", "// base\n// nox tweak\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "nox tweak")
+
+        accepted, deferred = sync_upstream.prove_protected_multisrc(base_sha, "upstream-spotless", ["src/pt/sample"], set())
+        self.assertIn("madara", accepted)
+        self.assertNotIn("madara", deferred)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1061,7 +1061,8 @@ def verify_migration_plan(
                 # Metadata generation does not compile the protected source and
                 # therefore cannot prove a libVersion API migration is safe.
                 tasks = [f":{unit.replace('/', ':')}:assembleDebug" for unit in units]
-                result = subprocess.run([str(sandbox / "gradlew"), *tasks], cwd=sandbox, text=True)
+                spotless_skips = ["-x", "spotlessApply", "-x", "spotlessCheck"] if (sandbox / "gradle").is_dir() else []
+                result = subprocess.run([str(sandbox / "gradlew"), *spotless_skips, *tasks], cwd=sandbox, text=True)
                 if result.returncode:
                     blocked.add(theme)
                     continue
@@ -2276,7 +2277,8 @@ def prove_protected_multisrc(
                 tree = subprocess.run(["git", "-C", str(sandbox), "write-tree"], capture_output=True, text=True, check=True).stdout.strip()
                 tasks = [f":{dependent.replace('/', ':')}:assembleDebug" for dependent in build_dependents]
                 tasks.append(f":lib-multisrc:{theme}:testDebugUnitTest")
-                proof = subprocess.run([str(sandbox / "gradlew"), *tasks], cwd=sandbox)
+                spotless_skips = ["-x", "spotlessApply", "-x", "spotlessCheck"] if (sandbox / "gradle").is_dir() else []
+                proof = subprocess.run([str(sandbox / "gradlew"), *spotless_skips, *tasks], cwd=sandbox)
                 if proof.returncode:
                     raise ValueError("proof build/tests failed")
                 if subprocess.run(["git", "-C", str(sandbox), "diff", "--quiet", tree, "--", *paths]).returncode:
