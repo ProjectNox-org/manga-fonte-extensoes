@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "War For Rayuba"
-    versionCode = 5
+    versionCode = 6
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
 

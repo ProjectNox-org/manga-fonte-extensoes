@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Pluma Comics"
-    versionCode = 53
+    versionCode = 54
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
 

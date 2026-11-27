@@ -16,12 +16,11 @@
         "src/pt/mangasbrasuka",
         "src/pt/mugiwarasoficial"
       ],
-      "upstream_ref": "293eb3cdbf4ca73ff238ab54cec3f095a3bdbdc2"
+      "upstream_ref": "7f91c9da5944b7b334758f3c437797fe31fc616c"
     },
     "catharsis": {
       "units": [
-        "src/es/aedex",
-        "src/es/catharsisworld"
+        "src/es/aedex"
       ],
       "upstream_ref": "upstream/main"
     },
@@ -34,7 +33,7 @@
     },
     "madara": {
       "patch_base": "f1bd88dacd89dfe644369c397efedf79965bf4c0",
-      "reason": "[Errno 2] No such file or directory: '/tmp/nox-multisrc-proof-rrza_7dy/repo/src/all/fastestmanga/build.gradle.kts'",
+      "reason": "incompatible dependent selector: src/id/kaguya",
       "units": [
         "src/all/allporncomicsco",
         "src/all/comicsvalley",
@@ -204,9 +203,11 @@
         "src/it/shinobiscans",
         "src/ja/kmansin09",
         "src/ko/goodtoon",
+        "src/ko/manga24",
         "src/pt/acervohentai",
         "src/pt/amuy",
         "src/pt/arthurscan",
+        "src/pt/blackparadise",
         "src/pt/borutoexplorer",
         "src/pt/cafecomyaoi",
         "src/pt/covenscan",
@@ -232,7 +233,6 @@
         "src/pt/portalyaoi",
         "src/pt/tankouhentai",
         "src/pt/tiamanhwa",
-        "src/pt/xxxyaoi",
         "src/pt/yaoifanclub",
         "src/pt/yuriverso",
         "src/th/cat300",
@@ -284,7 +284,16 @@
         "src/vi/truyentuoitho",
         "src/zh/bakamh"
       ],
-      "upstream_ref": "293eb3cdbf4ca73ff238ab54cec3f095a3bdbdc2"
+      "upstream_ref": "7f91c9da5944b7b334758f3c437797fe31fc616c"
+    },
+    "mangotheme": {
+      "patch_base": "293eb3cdbf4ca73ff238ab54cec3f095a3bdbdc2",
+      "reason": "proof build/tests failed",
+      "units": [
+        "src/pt/bladetoons",
+        "src/pt/imperiodabritannia"
+      ],
+      "upstream_ref": "7f91c9da5944b7b334758f3c437797fe31fc616c"
     }
   }
 }

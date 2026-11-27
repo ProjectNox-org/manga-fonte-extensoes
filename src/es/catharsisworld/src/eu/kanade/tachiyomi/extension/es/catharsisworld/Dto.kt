@@ -1,112 +1,28 @@
 package eu.kanade.tachiyomi.extension.es.catharsisworld
 
-import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import keiyoushi.utils.tryParse
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.JsonElement
-import kotlin.time.Instant
+import kotlinx.serialization.json.JsonObject
+import okhttp3.HttpUrl.Companion.toHttpUrl
 
+// A series card of the site's list
 @Serializable
-class MangaListDto(
-    val data: List<MangaDto>,
-    @SerialName("total_pages") val totalPages: Int,
-)
-
-@Serializable
-class MangaDto(
-    private val id: Int,
-    private val nombre: String,
-    @SerialName("portada_url") private val portadaUrl: String? = null,
-    private val descripcion: String? = null,
-    private val estado: String? = null,
-    private val tipo: String? = null,
-    @SerialName("nombre_alt_1") private val nombreAlt1: String? = null,
-    @SerialName("nombre_alt_2") private val nombreAlt2: String? = null,
-    @SerialName("fk_generos") private val generos: List<MangaGenreDto> = emptyList(),
-    val capitulos: List<ChapterDto> = emptyList(),
+internal class Card(
+    private val id: String,
+    private val title: String,
+    private val cover: String?,
+    private val badges: List<String> = emptyList(),
+    private val genres: List<String> = emptyList(),
 ) {
     fun toSManga(baseUrl: String) = SManga.create().apply {
-        url = id.toString()
-        title = nombre
-        thumbnail_url = portadaUrl?.let { "$baseUrl/assets/$it" }
-    }
-
-    fun toSMangaDetails(baseUrl: String) = toSManga(baseUrl).apply {
-        genre = (listOfNotNull(tipo?.replaceFirstChar(Char::uppercase)) + generos.map { it.genre.nombre }).joinToString().takeIf { it.isNotEmpty() }
-        description = buildString {
-            descripcion?.let { append(it.trim()) }
-            val altNames = listOfNotNull(nombreAlt1, nombreAlt2).filter(String::isNotBlank)
-            if (altNames.isNotEmpty()) {
-                if (isNotEmpty()) append("\n\n")
-                append("**Nombres alternativos:**\n", altNames.joinToString("\n") { "- $it" })
-            }
-        }.takeIf { it.isNotEmpty() }
-        status = when (estado) {
-            "curso" -> SManga.ONGOING
-            "pausado" -> SManga.ON_HIATUS
-            "terminado" -> SManga.COMPLETED
-            "abandonado" -> SManga.CANCELLED
-            else -> SManga.UNKNOWN
-        }
+        url = id
+        title = this@Card.title
+        thumbnail_url = cover?.let { baseUrl.toHttpUrl().resolve(it)?.newBuilder()?.query(null)?.build()?.toString() }
+        genre = genres.joinToString().ifEmpty { null }
+        status = statusOf(badges)
     }
 }
-
-@Serializable
-class MangaGenreDto(
-    @SerialName("generos_id") val genre: GenreDto,
-)
-
-@Serializable
-class GenreDto(
-    val id: String,
-    val nombre: String,
-)
-
-@Serializable
-class ChapterDto(
-    private val numero: Double,
-    private val titulo: String? = null,
-    val estado: String? = null,
-    @SerialName("fecha_publicacion") private val fechaPublicacion: String? = null,
-    @SerialName("date_created") private val dateCreated: String? = null,
-) {
-    val number get() = numero
-
-    fun toSChapter(mangaId: String) = SChapter.create().apply {
-        val num = numero.toString().removeSuffix(".0")
-        url = "$mangaId/$num"
-        name = titulo?.takeIf(String::isNotBlank) ?: "Capítulo $num"
-        chapter_number = numero.toFloat()
-        date_upload = Instant.tryParse(fechaPublicacion ?: dateCreated)
-    }
-}
-
-@Serializable
-class PagesDto(
-    val paginas: List<JsonElement>,
-    val chapterSessionToken: String,
-)
-
-@Serializable
-class PageTicketRequest(
-    private val pageIndex: Int,
-    private val sessionToken: String,
-)
-
-@Serializable
-class PageTicketResponse(
-    val signedToken: String,
-    val scrambleKey: String? = null,
-    val xorByte: Int,
-)
-
-@Serializable
-class ChapterTokenPayload(
-    val cid: Int,
-    val exp: Long,
-)
 
 @Serializable
 class SystemDto(
@@ -136,13 +52,7 @@ class CapRedeemRequest(
 @Serializable
 class CapRedeemResponse(
     val success: Boolean,
-    val token: String? = null,
-)
-
-@Serializable
-class ApiErrorDto(
-    val code: String? = null,
-    val retryAfterMs: Long? = null,
+    val token: String?,
 )
 
 @Serializable
@@ -152,7 +62,93 @@ class ReaderPassRequest(
 )
 
 @Serializable
-class ReaderPassDto(
-    val pass: String,
-    val expiresAt: Long,
+internal class PageRead(
+    val challenge: Boolean = false,
+    val status: Int?,
+    val obstacle: Obstacle?,
+    val result: JsonObject?,
 )
+
+@Serializable
+internal class Obstacle(val x: Float, val y: Float, val scale: Float)
+
+/** A point in CSS pixels, and whether its element is the one found at that point. */
+@Serializable
+class Point(
+    val x: Float,
+    val y: Float,
+    val clear: Boolean = true,
+    val fromX: Float?,
+    val fromY: Float?,
+)
+
+// What the reader script reads from the site's chapter reader
+@Serializable
+internal class ReaderPage(
+    val scale: Float,
+    val width: Float,
+    val height: Float,
+    val gate: Point?,
+    val check: Boolean = false,
+    val turnstile: Boolean = false,
+    val textOnly: Boolean = false,
+    val pages: List<ReaderItem> = emptyList(),
+    val grip: Point?,
+    val text: String?,
+    val image: PageImage?,
+)
+
+@Serializable
+internal class ReaderItem(val index: Int, val top: Float, val height: Float, val ready: Boolean, val retry: Point?)
+
+@Serializable
+internal class PageImage(val index: Int, val data: String)
+
+@Serializable
+internal class SeriesPage(
+    val scale: Float,
+    val id: String?,
+    val height: Float,
+    val width: Float,
+    val tap: Point?,
+    val title: String?,
+    val altTitle: String?,
+    val badges: List<String> = emptyList(),
+    val description: String?,
+    val cover: String?,
+    val scans: List<String> = emptyList(),
+    val author: String?,
+    val rows: List<Row> = emptyList(),
+    val more: Point?,
+    val count: Int = -1,
+    val rating: Float?,
+    val votes: Int?,
+)
+
+@Serializable
+internal class ListingPage(
+    val scale: Float,
+    val width: Float,
+    val height: Float,
+    val tap: Point?,
+    val error: Int?,
+    val cards: List<Card>?,
+    val next: Boolean = false,
+    val ids: Map<String, String?> = emptyMap(),
+)
+
+@Serializable
+internal class GenrePanel(
+    val scale: Float,
+    val width: Float,
+    val height: Float,
+    val tap: Point?,
+    val names: List<String>?,
+)
+
+// A genre of the filter panel, with its id in filter data stored by earlier versions
+@Serializable
+internal class GenreOption(val name: String, val id: String?)
+
+@Serializable
+internal class Row(val href: String, val heading: String, val title: String?, val age: String?)

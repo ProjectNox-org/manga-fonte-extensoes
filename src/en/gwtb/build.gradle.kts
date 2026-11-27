@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Gone with the Blastwave"
-    versionCode = 4
+    versionCode = 5
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
 

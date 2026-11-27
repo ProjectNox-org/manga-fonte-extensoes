@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "MHScans"
-    versionCode = 73
+    versionCode = 74
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
 

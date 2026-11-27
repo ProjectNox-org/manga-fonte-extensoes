@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "SayHentai"
-    versionCode = 20
+    versionCode = 21
     contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
     theme = "manhwaz"

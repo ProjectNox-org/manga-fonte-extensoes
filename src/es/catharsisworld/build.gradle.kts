@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Catharsis World"
-    versionCode = 7
+    versionCode = 11
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
