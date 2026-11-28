@@ -11,6 +11,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.annotation.Source
 import keiyoushi.network.Fetch
 import keiyoushi.network.get
+import keiyoushi.network.post
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.source.SMangaUpdate
@@ -21,8 +22,10 @@ import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonElement
+import keiyoushi.utils.toJsonRequestBody
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.json.JsonElement
+import okhttp3.CacheControl
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
@@ -164,7 +167,21 @@ abstract class Comicaso :
     }
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val document = client.get(getChapterUrl(chapter), Fetch.DOCUMENT).asJsoup()
+        val chapterUrl = getChapterUrl(chapter)
+        var document = client.get(chapterUrl, Fetch.DOCUMENT, CacheControl.FORCE_NETWORK).asJsoup()
+        document.selectFirst("[data-detail-track]")?.let { track ->
+            val verifyHeaders = headers.newBuilder()
+                .add("X-CSRF-Token", track.attr("data-csrf"))
+                .build()
+            val result = client.post(
+                "$baseUrl/api/detail-verification",
+                verifyHeaders,
+                Fetch.XHR.from(chapterUrl),
+                VerificationDto(track.attr("data-token"), 1200, 8, 1).toJsonRequestBody(),
+            ).parseAs<VerificationResultDto>()
+            if (result.ok != true) return emptyList()
+            document = client.get(chapterUrl, Fetch.DOCUMENT, CacheControl.FORCE_NETWORK).asJsoup()
+        }
         return document.select("#reader-images img").mapIndexed { index, image ->
             val url = image.absUrl("src").toHttpUrl()
             val altHosts = image.attrOrNull("data-media-sources")?.parseAs<List<MediaSourceDto>>().orEmpty()
