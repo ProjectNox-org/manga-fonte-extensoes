@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "MangaHub.fr"
-    versionCode = 4
+    versionCode = 5
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
     theme = "madara"

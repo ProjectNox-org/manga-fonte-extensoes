@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Hentai-Scantrad"
-    versionCode = 3
+    versionCode = 4
     contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
     theme = "madara"

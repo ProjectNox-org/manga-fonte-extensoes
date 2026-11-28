@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "TruyenTuoiTho"
-    versionCode = 9
+    versionCode = 10
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
     theme = "madara"

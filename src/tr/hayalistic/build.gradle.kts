@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Hayalistic"
-    versionCode = 7
+    versionCode = 8
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
     theme = "madara"

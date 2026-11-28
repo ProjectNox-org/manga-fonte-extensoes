@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Rose Squad Scans"
-    versionCode = 2
+    versionCode = 3
     contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
     theme = "madara"

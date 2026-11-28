@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Manhwa-raw"
-    versionCode = 5
+    versionCode = 6
     contentWarning = ContentWarning.NSFW // or MIXED, please confirm
     libVersion = "1.6"
     theme = "madara"

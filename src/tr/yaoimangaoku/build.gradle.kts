@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Yaoi Manga Oku"
-    versionCode = 2
+    versionCode = 3
     contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
     theme = "madara"

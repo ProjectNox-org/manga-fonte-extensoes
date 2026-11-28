@@ -7,7 +7,7 @@ plugins {
 keiyoushi {
     name = "Minda Fansub"
     theme = "madara"
-    versionCode = 2
+    versionCode = 3
     contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
 

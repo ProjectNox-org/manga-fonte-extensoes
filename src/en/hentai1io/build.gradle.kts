@@ -7,7 +7,7 @@ plugins {
 keiyoushi {
     name = "Hentai1.io"
     theme = "madara"
-    versionCode = 1
+    versionCode = 2
     contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
 
